@@ -4,7 +4,7 @@ Retina Dummy 是一个轻量的 macOS 菜单栏工具，主要用于将 Mac mini
 
 ![Retina Dummy app icon](Resources/AppIcon-1024.png)
 
-> 当前版本：0.7.1。下载可运行版本请前往 GitHub Releases；源码可直接使用 Xcode Command Line Tools 构建。
+> **普通用户可直接安装：**前往 [GitHub Releases](https://github.com/TC023456-sys/RetinaDummy/releases/latest) 下载 `Retina-Dummy.zip`，解压后将 `Retina Dummy.app` 拖入“应用程序”即可。无需安装 Xcode；下方“本地构建”仅供开发者使用。
 
 ## 适用场景
 
