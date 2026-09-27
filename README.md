@@ -1,10 +1,17 @@
 # Retina Dummy
 
-Retina Dummy 是一个轻量的 macOS 菜单栏工具，为无实体显示器的 Mac 创建 HiDPI 虚拟屏幕。适合远程桌面、无头 Mac 和录屏场景。
+Retina Dummy 是一个轻量的 macOS 菜单栏工具，主要用于将 Mac mini 作为无头服务器远程使用时创建 HiDPI 虚拟屏幕。即使没有连接实体显示器，远程桌面也能获得清晰、可调的 Retina 分辨率，无需额外购买或插入 HDMI 显示器诱骗器（Dummy Plug）。它同样适合其他无头 Mac 和录屏场景。
 
 ![Retina Dummy app icon](Resources/AppIcon-1024.png)
 
 > 当前版本：0.7.1。下载可运行版本请前往 GitHub Releases；源码可直接使用 Xcode Command Line Tools 构建。
+
+## 适用场景
+
+- 将 Mac mini 作为家庭服务器、开发服务器或远程工作主机
+- 无实体显示器连接时，为远程桌面提供稳定的虚拟屏幕
+- 替代 HDMI 显示器诱骗器（Dummy Plug），减少额外硬件和接口占用
+- 为远程控制、串流和录屏提供清晰的 HiDPI 分辨率
 
 ## 功能
 
