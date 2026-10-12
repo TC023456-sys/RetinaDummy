@@ -1,0 +1,30 @@
+name: Build and release
+on:
+  push:
+    branches: [main]
+    paths: [Info.plist, main.m, build.sh, .github/workflows/release.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and verify
+        run: |
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
+          BUILD_NUMBER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Info.plist)
+          VERSION="$VERSION" BUILD_NUMBER="$BUILD_NUMBER" zsh ./build.sh
+          unzip -t '../../outputs/Retina-Dummy.zip'
+          echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v$RELEASE_VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release already exists; refusing to replace published files."
+            exit 1
+          fi
+          gh release create "$TAG" '../../outputs/Retina-Dummy.zip' --target "$GITHUB_SHA" --title "Retina Dummy $TAG" --notes-file CHANGELOG.md

@@ -101,7 +101,7 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     return label;
 }
 
-@interface AppDelegate : NSObject <NSApplicationDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSMutableArray<CGVirtualDisplay *> *displays;
 @property(nonatomic) NSUInteger selectedProfile;
@@ -110,6 +110,9 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 @property(nonatomic) unsigned int customLogicalHeight;
 @property(nonatomic) double selectedRefreshRate;
 @property(nonatomic, strong) NSWindow *aboutWindow;
+@property(nonatomic) CGDirectDisplayID mirroredPhysicalDisplay;
+@property(nonatomic) CGDirectDisplayID previousMirror;
+@property(nonatomic) BOOL checkingUpdate;
 - (DisplayProfile)currentProfile;
 - (void)restartDisplaysIfActive;
 - (void)showResolutionPicker:(id)sender;
@@ -150,8 +153,22 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     [self startDisplay:nil];
 }
 
+- (void)menuNeedsUpdate:(NSMenu *)menu {
+    (void)menu;
+    [self rebuildMenu];
+    NSMenu *updated = self.statusItem.menu;
+    if (updated != menu) {
+        [menu removeAllItems];
+        for (NSMenuItem *item in [updated.itemArray copy]) {
+            [updated removeItem:item]; [menu addItem:item];
+        }
+        self.statusItem.menu = menu;
+    }
+}
+
 - (void)rebuildMenu {
     NSMenu *menu = [[NSMenu alloc] init];
+    menu.delegate = self;
     BOOL active = self.displays.count > 0;
     NSString *headerTitle = active
         ? [NSString stringWithFormat:@"%lu 个虚拟显示器已开启", (unsigned long)self.displays.count]
@@ -161,6 +178,32 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     [menu addItem:header];
     [menu addItem:[NSMenuItem separatorItem]];
 
+    NSMenuItem *physical = [[NSMenuItem alloc] initWithTitle:@"真实显示器高清缩放" action:nil keyEquivalent:@""];
+    NSMenu *physicalMenu = [[NSMenu alloc] init];
+    uint32_t count = 0; CGDirectDisplayID ids[64];
+    CGGetOnlineDisplayList(64, ids, &count);
+    for (uint32_t i = 0; i < count; i++) {
+        CGDirectDisplayID displayID = ids[i];
+        if (CGDisplayVendorNumber(displayID) == 0xB33F) continue;
+        NSString *name = [NSString stringWithFormat:@"显示器 %u", displayID];
+        for (NSScreen *screen in NSScreen.screens) {
+            if ([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == displayID) name = screen.localizedName;
+        }
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:name action:nil keyEquivalent:@""];
+        NSMenu *options = [[NSMenu alloc] init];
+        NSMenuItem *mirror = [[NSMenuItem alloc] initWithTitle:@"使用当前 HiDPI 设置" action:@selector(enablePhysicalHiDPI:) keyEquivalent:@""];
+        mirror.target = self; mirror.representedObject = @(displayID);
+        mirror.state = self.mirroredPhysicalDisplay == displayID ? NSControlStateValueOn : NSControlStateValueOff;
+        [options addItem:mirror]; item.submenu = options; [physicalMenu addItem:item];
+    }
+    if (!physicalMenu.numberOfItems) [physicalMenu addItemWithTitle:@"未连接真实显示器" action:nil keyEquivalent:@""];
+    if (self.mirroredPhysicalDisplay) {
+        [physicalMenu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem *restore = [[NSMenuItem alloc] initWithTitle:@"恢复原来的镜像设置" action:@selector(restorePhysicalDisplay:) keyEquivalent:@""];
+        restore.target = self; [physicalMenu addItem:restore];
+    }
+    physical.submenu = physicalMenu; [menu addItem:physical];
+    [menu addItem:[NSMenuItem separatorItem]];
     DisplayProfile currentProfile = [self currentProfile];
     NSMenuItem *resolutionItem = [[NSMenuItem alloc]
         initWithTitle:[NSString stringWithFormat:@"HiDPI 设置…   %u × %u @ %.0fHz", currentProfile.logicalWidth, currentProfile.logicalHeight, self.selectedRefreshRate]
@@ -195,6 +238,8 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     [menu addItem:login];
     [menu addItem:[NSMenuItem separatorItem]];
 
+    NSMenuItem *update = [[NSMenuItem alloc] initWithTitle:(self.checkingUpdate ? @"正在检查更新…" : @"检查更新…") action:@selector(checkForUpdates:) keyEquivalent:@""];
+    update.target = self; update.enabled = !self.checkingUpdate; [menu addItem:update];
     NSMenuItem *about = [[NSMenuItem alloc] initWithTitle:@"关于 Retina Dummy" action:@selector(showAbout:) keyEquivalent:@""];
     about.target = self;
     [menu addItem:about];
@@ -210,6 +255,47 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     quit.target = NSApp;
     [menu addItem:quit];
     self.statusItem.menu = menu;
+}
+
+- (void)checkForUpdates:(id)sender {
+    (void)sender;
+    if (self.checkingUpdate) return;
+    self.checkingUpdate = YES; [self rebuildMenu];
+    NSURL *url = [NSURL URLWithString:@"https://api.github.com/repos/TC023456-sys/RetinaDummy/releases/latest"];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:20];
+    [request setValue:@"application/vnd.github+json" forHTTPHeaderField:@"Accept"];
+    [request setValue:@"RetinaDummy-UpdateCheck" forHTTPHeaderField:@"User-Agent"];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
+        NSDictionary *release = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        if (![release isKindOfClass:NSDictionary.class]) release = nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.checkingUpdate = NO; [self rebuildMenu];
+            if (error || http.statusCode != 200 || ![release[@"tag_name"] isKindOfClass:NSString.class]) {
+                [self showError:@"检查更新失败，请稍后重试。也可访问 GitHub Releases 下载新版。"]; return;
+            }
+            NSString *version = release[@"tag_name"];
+            if ([version hasPrefix:@"v"]) version = [version substringFromIndex:1];
+            NSString *current = NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"0";
+            NSAlert *alert = [[NSAlert alloc] init];
+            if ([version compare:current options:NSNumericSearch] != NSOrderedDescending) {
+                alert.messageText = @"已是最新版本";
+                alert.informativeText = [NSString stringWithFormat:@"当前版本：%@", current];
+                [alert addButtonWithTitle:@"好"]; [NSApp activateIgnoringOtherApps:YES]; [alert runModal]; return;
+            }
+            NSURL *download = nil;
+            if ([release[@"assets"] isKindOfClass:NSArray.class]) for (id asset in release[@"assets"]) {
+                if (![asset isKindOfClass:NSDictionary.class] || ![asset[@"name"] isEqual:@"Retina-Dummy.zip"] || ![asset[@"browser_download_url"] isKindOfClass:NSString.class]) continue;
+                NSURL *candidate = [NSURL URLWithString:asset[@"browser_download_url"]];
+                if ([candidate.scheme isEqual:@"https"] && [candidate.host isEqual:@"github.com"] && [candidate.path hasPrefix:@"/TC023456-sys/RetinaDummy/releases/download/"]) download = candidate;
+            }
+            alert.messageText = [NSString stringWithFormat:@"发现新版本 %@", version];
+            alert.informativeText = @"下载后退出 Retina Dummy，解压并替换“应用程序”中的旧版本，再重新打开。";
+            [alert addButtonWithTitle:@"下载新版"]; [alert addButtonWithTitle:@"稍后"];
+            [NSApp activateIgnoringOtherApps:YES];
+            if ([alert runModal] == NSAlertFirstButtonReturn) [[NSWorkspace sharedWorkspace] openURL:download ?: [NSURL URLWithString:@"https://github.com/TC023456-sys/RetinaDummy/releases/latest"]];
+        });
+    }] resume];
 }
 
 - (void)showAbout:(id)sender {
@@ -493,6 +579,8 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 }
 
 - (void)restartDisplaysIfActive {
+    [self restorePhysicalDisplay:nil];
+    if (self.mirroredPhysicalDisplay) return;
     BOOL wasActive = self.displays.count > 0;
     self.displays = nil;
     [self rebuildMenu];
@@ -583,8 +671,53 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     [self rebuildMenu];
 }
 
+- (BOOL)configurePhysicalDisplay:(CGDirectDisplayID)display mirror:(CGDirectDisplayID)source {
+    CGDisplayConfigRef config = NULL;
+    CGError result = CGBeginDisplayConfiguration(&config);
+    if (result != kCGErrorSuccess) return NO;
+    result = CGConfigureDisplayMirrorOfDisplay(config, display, source);
+    if (result == kCGErrorSuccess) result = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
+    else CGCancelDisplayConfiguration(config);
+    if (result != kCGErrorSuccess) { [self showError:[NSString stringWithFormat:@"macOS 未接受镜像设置（%d）。", result]]; return NO; }
+    return YES;
+}
+
+- (void)restorePhysicalDisplay:(id)sender {
+    (void)sender;
+    if (!self.mirroredPhysicalDisplay) return;
+    if (!CGDisplayIsOnline(self.mirroredPhysicalDisplay) ||
+        [self configurePhysicalDisplay:self.mirroredPhysicalDisplay mirror:
+            (CGDisplayIsOnline(self.previousMirror) ? self.previousMirror : kCGNullDirectDisplay)]) {
+        self.mirroredPhysicalDisplay = 0; self.previousMirror = 0;
+    }
+    [self rebuildMenu];
+}
+
+- (void)enablePhysicalHiDPI:(NSMenuItem *)sender {
+    CGDirectDisplayID target = [sender.representedObject unsignedIntValue];
+    if (!CGDisplayIsOnline(target)) { [self showError:@"显示器已断开，请重新打开菜单。"]; return; }
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"开启真实显示器高清缩放？";
+    alert.informativeText = @"将真实显示器镜像到 Retina Dummy，使用当前 HiDPI 分辨率。屏幕可能短暂闪烁；可从菜单恢复镜像设置。";
+    [alert addButtonWithTitle:@"开启"]; [alert addButtonWithTitle:@"取消"];
+    if ([alert runModal] != NSAlertFirstButtonReturn) return;
+    if (self.mirroredPhysicalDisplay && self.mirroredPhysicalDisplay != target) {
+        [self restorePhysicalDisplay:nil]; if (self.mirroredPhysicalDisplay) return;
+    }
+    [self startDisplay:nil];
+    if (!self.displays.count) return;
+    CGDirectDisplayID source = self.displays.firstObject.displayID;
+    CGDirectDisplayID previous = CGDisplayMirrorsDisplay(target);
+    if ([self configurePhysicalDisplay:target mirror:source]) {
+        if (self.mirroredPhysicalDisplay != target) self.previousMirror = previous;
+        self.mirroredPhysicalDisplay = target; [self rebuildMenu];
+    }
+}
+
 - (void)stopDisplay:(id)sender {
     (void)sender;
+    [self restorePhysicalDisplay:nil];
+    if (self.mirroredPhysicalDisplay) return;
     self.displays = nil;
     self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"display" accessibilityDescription:@"Retina Dummy"];
     [self rebuildMenu];
@@ -592,6 +725,8 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     (void)sender;
+    [self restorePhysicalDisplay:nil];
+    if (self.mirroredPhysicalDisplay) return NSTerminateCancel;
     self.displays = nil;
     return NSTerminateNow;
 }

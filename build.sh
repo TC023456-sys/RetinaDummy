@@ -6,11 +6,13 @@ STAGE="$(mktemp -d)/Retina Dummy.app"
 trap 'rm -rf "${STAGE:h}"' EXIT
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 
-VERSION="${VERSION:-0.7.1}"
-BUILD_NUMBER="${BUILD_NUMBER:-10}"
+VERSION="${VERSION:-0.8.0}"
+BUILD_NUMBER="${BUILD_NUMBER:-11}"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:--}"
 
-clang -Wall -Wextra -fobjc-arc -fmodules -mmacosx-version-min=13.0 \
+mkdir -p "${OUT:h}"
+
+clang -arch arm64 -arch x86_64 -Wall -Wextra -fobjc-arc -fmodules -mmacosx-version-min=13.0 \
   -framework Cocoa -framework CoreGraphics -framework ServiceManagement \
   "$ROOT/main.m" -o "$STAGE/Contents/MacOS/RetinaDummy"
 cp "$ROOT/Info.plist" "$STAGE/Contents/Info.plist"

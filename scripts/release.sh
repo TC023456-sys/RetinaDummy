@@ -4,14 +4,14 @@ set -euo pipefail
 ROOT="${0:A:h:h}"
 OUTPUTS="$ROOT/../../outputs"
 APP="$OUTPUTS/Retina Dummy.app"
-DMG="$OUTPUTS/Retina-Dummy-${VERSION:-0.7.1}.dmg"
+DMG="$OUTPUTS/Retina-Dummy-${VERSION:-0.8.0}.dmg"
 
 if [[ -z "${SIGNING_IDENTITY:-}" ]]; then
   echo "SIGNING_IDENTITY is required for a public release." >&2
   exit 1
 fi
 
-SIGNING_IDENTITY="$SIGNING_IDENTITY" VERSION="${VERSION:-0.7.1}" BUILD_NUMBER="${BUILD_NUMBER:-10}" "$ROOT/build.sh"
+SIGNING_IDENTITY="$SIGNING_IDENTITY" VERSION="${VERSION:-0.8.0}" BUILD_NUMBER="${BUILD_NUMBER:-11}" "$ROOT/build.sh"
 
 staging="$(mktemp -d)"
 trap 'rm -rf "$staging"' EXIT
