@@ -150,7 +150,7 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 @property(nonatomic) BOOL checkingUpdate;
 @property(nonatomic) BOOL manualUpdateRequested;
 @property(nonatomic, strong) NSTimer *updateTimer;
-@property(nonatomic, strong) BrightnessController *brightnessController;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *,BrightnessController *> *brightnessControllers;
 - (BOOL)automaticUpdateChecksEnabled;
 - (void)checkAutomatically:(id)sender;
 - (void)beginUpdateCheckManual:(BOOL)manual;
@@ -226,6 +226,8 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     NSMenu *physicalMenu = [[NSMenu alloc] init];
     uint32_t count = 0; CGDirectDisplayID ids[64];
     CGGetOnlineDisplayList(64, ids, &count);
+    if (!self.brightnessControllers) self.brightnessControllers = [NSMutableDictionary dictionary];
+    NSMutableSet<NSNumber *> *connectedBrightnessDisplays = [NSMutableSet set];
     for (uint32_t i = 0; i < count; i++) {
         CGDirectDisplayID displayID = ids[i];
         if (CGDisplayVendorNumber(displayID) == 0xB33F) continue;
@@ -252,12 +254,26 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
         mirror.state = self.mirroredPhysicalDisplay == displayID ? NSControlStateValueOn : NSControlStateValueOff;
         [options addItem:mirror];
         if (!CGDisplayIsBuiltin(displayID)) {
+            NSNumber *key = @(displayID);
+            [connectedBrightnessDisplays addObject:key];
+            BrightnessController *controller = self.brightnessControllers[key];
+            if (!controller) {
+                controller = [[BrightnessController alloc] init];
+                self.brightnessControllers[key] = controller;
+            }
+            NSMenuItem *inlineBrightness = [[NSMenuItem alloc] initWithTitle:[name stringByAppendingString:@" 亮度"] action:nil keyEquivalent:@""];
+            inlineBrightness.view = [controller menuViewForDisplay:displayID name:name];
+            [menu addItem:inlineBrightness];
+            [menu addItem:[NSMenuItem separatorItem]];
             NSMenuItem *brightness = [[NSMenuItem alloc] initWithTitle:@"调节实体亮度…" action:@selector(adjustBrightness:) keyEquivalent:@""];
             brightness.target = self;
             brightness.representedObject = @{@"id":@(displayID),@"name":name};
             [options addItem:brightness];
         }
         item.submenu = options; [physicalMenu addItem:item];
+    }
+    for (NSNumber *key in self.brightnessControllers.allKeys) {
+        if (![connectedBrightnessDisplays containsObject:key]) [self.brightnessControllers removeObjectForKey:key];
     }
     if (!physicalMenu.numberOfItems) [physicalMenu addItemWithTitle:@"未连接真实显示器" action:nil keyEquivalent:@""];
     if (self.mirroredPhysicalDisplay) {
@@ -325,8 +341,8 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 }
 
 - (void)adjustBrightness:(NSMenuItem *)item {
-    if (!self.brightnessController) self.brightnessController = [[BrightnessController alloc] init];
-    [self.brightnessController showForDisplay:[item.representedObject[@"id"] unsignedIntValue] name:item.representedObject[@"name"]];
+    BrightnessController *controller = self.brightnessControllers[item.representedObject[@"id"]];
+    [controller showForDisplay:[item.representedObject[@"id"] unsignedIntValue] name:item.representedObject[@"name"]];
 }
 
 - (BOOL)automaticUpdateChecksEnabled {

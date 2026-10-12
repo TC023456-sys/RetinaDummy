@@ -19,6 +19,10 @@ jobs:
         run: |
           clang -Wall -Wextra -Werror tests/brightness-protocol.c -o /tmp/brightness-tests
           /tmp/brightness-tests
+      - name: Test inline brightness menu
+        run: |
+          clang -Wall -Wextra -fobjc-arc -framework Cocoa -framework CoreGraphics -I . tests/brightness-menu.m BrightnessController.m -o "$RUNNER_TEMP/brightness-menu-tests"
+          "$RUNNER_TEMP/brightness-menu-tests"
       - name: Build and verify
         run: |
           VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
