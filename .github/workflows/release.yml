@@ -2,7 +2,7 @@ name: Build and release
 on:
   push:
     branches: [main]
-    paths: [Info.plist, main.m, build.sh, .github/workflows/release.yml]
+    paths: [Info.plist, main.m, UpdateCheck.h, tests/update-check.m, build.sh, .github/workflows/release.yml]
   workflow_dispatch:
 permissions:
   contents: write
@@ -11,6 +11,10 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: Test update selection and daily scheduling
+        run: |
+          clang -Wall -Wextra -fobjc-arc -framework Foundation tests/update-check.m -o "$RUNNER_TEMP/retina-update-tests"
+          "$RUNNER_TEMP/retina-update-tests"
       - name: Build and verify
         run: |
           VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)

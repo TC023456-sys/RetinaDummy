@@ -3,6 +3,7 @@
 #import <ServiceManagement/ServiceManagement.h>
 #import <objc/runtime.h>
 #import <math.h>
+#import "UpdateCheck.h"
 
 @interface CGVirtualDisplayDescriptor : NSObject
 @property(nonatomic, copy) NSString *name;
@@ -127,6 +128,11 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 @property(nonatomic) CGDirectDisplayID mirroredPhysicalDisplay;
 @property(nonatomic) CGDirectDisplayID previousMirror;
 @property(nonatomic) BOOL checkingUpdate;
+@property(nonatomic) BOOL manualUpdateRequested;
+@property(nonatomic, strong) NSTimer *updateTimer;
+- (BOOL)automaticUpdateChecksEnabled;
+- (void)checkAutomatically:(id)sender;
+- (void)beginUpdateCheckManual:(BOOL)manual;
 - (DisplayProfile)currentProfile;
 - (void)restartDisplaysIfActive;
 - (void)showResolutionPicker:(id)sender;
@@ -165,6 +171,9 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     [self restoreLoginItemIfRequested];
     [self rebuildMenu];
     [self startDisplay:nil];
+    self.updateTimer = [NSTimer scheduledTimerWithTimeInterval:3600 target:self selector:@selector(checkAutomatically:) userInfo:nil repeats:YES];
+    self.updateTimer.tolerance = 60;
+    [self checkAutomatically:nil];
 }
 
 - (void)menuNeedsUpdate:(NSMenu *)menu {
@@ -266,6 +275,10 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 
     NSMenuItem *update = [[NSMenuItem alloc] initWithTitle:(self.checkingUpdate ? @"正在检查更新…" : @"检查更新…") action:@selector(checkForUpdates:) keyEquivalent:@""];
     update.target = self; update.enabled = !self.checkingUpdate; [menu addItem:update];
+    NSMenuItem *automatic = [[NSMenuItem alloc] initWithTitle:@"自动检查更新（每天一次）" action:@selector(toggleAutomaticUpdateChecks:) keyEquivalent:@""];
+    automatic.target = self;
+    automatic.state = [self automaticUpdateChecksEnabled] ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:automatic];
     NSMenuItem *about = [[NSMenuItem alloc] initWithTitle:@"关于 Retina Dummy" action:@selector(showAbout:) keyEquivalent:@""];
     about.target = self;
     [menu addItem:about];
@@ -283,43 +296,76 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     self.statusItem.menu = menu;
 }
 
+- (BOOL)automaticUpdateChecksEnabled {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    return [defaults objectForKey:@"automaticUpdateChecks"] ? [defaults boolForKey:@"automaticUpdateChecks"] : YES;
+}
+
+- (void)toggleAutomaticUpdateChecks:(id)sender {
+    (void)sender;
+    [NSUserDefaults.standardUserDefaults setBool:![self automaticUpdateChecksEnabled] forKey:@"automaticUpdateChecks"];
+    [self rebuildMenu];
+    [self checkAutomatically:nil];
+}
+
+- (void)checkAutomatically:(id)sender {
+    (void)sender;
+    NSTimeInterval last = [NSUserDefaults.standardUserDefaults doubleForKey:@"lastSuccessfulUpdateCheck"];
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    NSTimeInterval attempted = [NSUserDefaults.standardUserDefaults doubleForKey:@"lastAutomaticUpdateAttempt"];
+    if (!self.checkingUpdate && RetinaAutomaticUpdateDue([self automaticUpdateChecksEnabled], last, attempted, now)) {
+        [NSUserDefaults.standardUserDefaults setDouble:now forKey:@"lastAutomaticUpdateAttempt"];
+        [self beginUpdateCheckManual:NO];
+    }
+}
+
 - (void)checkForUpdates:(id)sender {
     (void)sender;
+    [self beginUpdateCheckManual:YES];
+}
+
+- (void)beginUpdateCheckManual:(BOOL)manual {
+    if (manual) self.manualUpdateRequested = YES;
     if (self.checkingUpdate) return;
     self.checkingUpdate = YES; [self rebuildMenu];
-    NSURL *url = [NSURL URLWithString:@"https://api.github.com/repos/TC023456-sys/RetinaDummy/releases/latest"];
+    NSURL *url = [NSURL URLWithString:@"https://api.github.com/repos/TC023456-sys/RetinaDummy/releases?per_page=100"];
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:20];
     [request setValue:@"application/vnd.github+json" forHTTPHeaderField:@"Accept"];
     [request setValue:@"RetinaDummy-UpdateCheck" forHTTPHeaderField:@"User-Agent"];
     [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        NSHTTPURLResponse *http = (NSHTTPURLResponse *)response;
-        NSDictionary *release = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-        if (![release isKindOfClass:NSDictionary.class]) release = nil;
+        NSHTTPURLResponse *http = [response isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)response : nil;
+        id releases = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        NSDictionary *latest = RetinaLatestRelease(releases);
         dispatch_async(dispatch_get_main_queue(), ^{
+            BOOL requestedManually = self.manualUpdateRequested;
+            self.manualUpdateRequested = NO;
             self.checkingUpdate = NO; [self rebuildMenu];
-            if (error || http.statusCode != 200 || ![release[@"tag_name"] isKindOfClass:NSString.class]) {
-                [self showError:@"检查更新失败，请稍后重试。也可访问 GitHub Releases 下载新版。"]; return;
+            if (error || http.statusCode != 200 || !latest) {
+                if (requestedManually) [self showError:@"检查更新失败，请稍后重试。也可访问 GitHub Releases 下载新版。"];
+                return;
             }
-            NSString *version = release[@"tag_name"];
-            if ([version hasPrefix:@"v"]) version = [version substringFromIndex:1];
+            NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+            [defaults setDouble:NSDate.date.timeIntervalSince1970 forKey:@"lastSuccessfulUpdateCheck"];
+            if (!requestedManually && ![self automaticUpdateChecksEnabled]) return;
+            NSString *version = latest[@"version"];
             NSString *current = NSBundle.mainBundle.infoDictionary[@"CFBundleShortVersionString"] ?: @"0";
-            NSAlert *alert = [[NSAlert alloc] init];
             if ([version compare:current options:NSNumericSearch] != NSOrderedDescending) {
-                alert.messageText = @"已是最新版本";
-                alert.informativeText = [NSString stringWithFormat:@"当前版本：%@", current];
-                [alert addButtonWithTitle:@"好"]; [NSApp activateIgnoringOtherApps:YES]; [alert runModal]; return;
+                if (requestedManually) {
+                    NSAlert *alert = [[NSAlert alloc] init];
+                    alert.messageText = @"已是最新版本";
+                    alert.informativeText = [NSString stringWithFormat:@"当前版本：%@\n更新来源：TC023456-sys/RetinaDummy", current];
+                    [alert addButtonWithTitle:@"好"]; [NSApp activateIgnoringOtherApps:YES]; [alert runModal];
+                }
+                return;
             }
-            NSURL *download = nil;
-            if ([release[@"assets"] isKindOfClass:NSArray.class]) for (id asset in release[@"assets"]) {
-                if (![asset isKindOfClass:NSDictionary.class] || ![asset[@"name"] isEqual:@"Retina-Dummy.zip"] || ![asset[@"browser_download_url"] isKindOfClass:NSString.class]) continue;
-                NSURL *candidate = [NSURL URLWithString:asset[@"browser_download_url"]];
-                if ([candidate.scheme isEqual:@"https"] && [candidate.host isEqual:@"github.com"] && [candidate.path hasPrefix:@"/TC023456-sys/RetinaDummy/releases/download/"]) download = candidate;
-            }
+            if (!requestedManually && [[defaults stringForKey:@"lastNotifiedUpdateVersion"] isEqual:version]) return;
+            [defaults setObject:version forKey:@"lastNotifiedUpdateVersion"];
+            NSAlert *alert = [[NSAlert alloc] init];
             alert.messageText = [NSString stringWithFormat:@"发现新版本 %@", version];
-            alert.informativeText = @"下载后退出 Retina Dummy，解压并替换“应用程序”中的旧版本，再重新打开。";
+            alert.informativeText = @"更新来源：TC023456-sys/RetinaDummy\n下载后退出 Retina Dummy，解压并替换“应用程序”中的旧版本，再重新打开。";
             [alert addButtonWithTitle:@"下载新版"]; [alert addButtonWithTitle:@"稍后"];
             [NSApp activateIgnoringOtherApps:YES];
-            if ([alert runModal] == NSAlertFirstButtonReturn) [[NSWorkspace sharedWorkspace] openURL:download ?: [NSURL URLWithString:@"https://github.com/TC023456-sys/RetinaDummy/releases/latest"]];
+            if ([alert runModal] == NSAlertFirstButtonReturn) [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:latest[@"download"]]];
         });
     }] resume];
 }
@@ -754,6 +800,8 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     [self restorePhysicalDisplay:nil];
     if (self.mirroredPhysicalDisplay) return NSTerminateCancel;
     self.displays = nil;
+    [self.updateTimer invalidate];
+    self.updateTimer = nil;
     return NSTerminateNow;
 }
 @end
