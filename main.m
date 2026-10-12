@@ -3,7 +3,9 @@
 #import <ServiceManagement/ServiceManagement.h>
 #import <objc/runtime.h>
 #import <math.h>
+#import <dlfcn.h>
 #import "UpdateCheck.h"
+#import "BrightnessController.h"
 
 @interface CGVirtualDisplayDescriptor : NSObject
 @property(nonatomic, copy) NSString *name;
@@ -91,6 +93,24 @@ static BOOL RuntimeSupportsVirtualDisplays(NSString **error) {
     return YES;
 }
 
+// Mirrored physical displays may be absent from NSScreen.screens. Resolve
+// their hardware name separately, with a fallback if this private API changes.
+static NSString *PhysicalDisplayName(CGDirectDisplayID displayID) {
+    static CFDictionaryRef (*copyInfo)(CGDirectDisplayID);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        void *library = dlopen("/System/Library/Frameworks/CoreDisplay.framework/CoreDisplay", RTLD_LAZY);
+        if (library) copyInfo = dlsym(library, "CoreDisplay_DisplayCreateInfoDictionary");
+    });
+    NSDictionary *info = copyInfo ? CFBridgingRelease(copyInfo(displayID)) : nil;
+    id names = info[@"DisplayProductName"];
+    if ([names isKindOfClass:NSDictionary.class]) {
+        id name = names[NSLocale.currentLocale.localeIdentifier] ?: names[@"en_US"] ?: [names allValues].firstObject;
+        if ([name isKindOfClass:NSString.class]) return name;
+    } else if ([names isKindOfClass:NSString.class]) return names;
+    return [NSString stringWithFormat:@"显示器 %u", displayID];
+}
+
 static double MaximumDisplayRefreshRate(CGDirectDisplayID displayID) {
     double maximum = 0;
     CFArrayRef modes = CGDisplayCopyAllDisplayModes(displayID, NULL);
@@ -130,6 +150,7 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 @property(nonatomic) BOOL checkingUpdate;
 @property(nonatomic) BOOL manualUpdateRequested;
 @property(nonatomic, strong) NSTimer *updateTimer;
+@property(nonatomic, strong) BrightnessController *brightnessController;
 - (BOOL)automaticUpdateChecksEnabled;
 - (void)checkAutomatically:(id)sender;
 - (void)beginUpdateCheckManual:(BOOL)manual;
@@ -208,7 +229,7 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     for (uint32_t i = 0; i < count; i++) {
         CGDirectDisplayID displayID = ids[i];
         if (CGDisplayVendorNumber(displayID) == 0xB33F) continue;
-        NSString *name = [NSString stringWithFormat:@"显示器 %u", displayID];
+        NSString *name = PhysicalDisplayName(displayID);
         for (NSScreen *screen in NSScreen.screens) {
             if ([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == displayID) name = screen.localizedName;
         }
@@ -229,7 +250,14 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
         NSMenuItem *mirror = [[NSMenuItem alloc] initWithTitle:@"使用当前 HiDPI 设置" action:@selector(enablePhysicalHiDPI:) keyEquivalent:@""];
         mirror.target = self; mirror.representedObject = @(displayID);
         mirror.state = self.mirroredPhysicalDisplay == displayID ? NSControlStateValueOn : NSControlStateValueOff;
-        [options addItem:mirror]; item.submenu = options; [physicalMenu addItem:item];
+        [options addItem:mirror];
+        if (!CGDisplayIsBuiltin(displayID)) {
+            NSMenuItem *brightness = [[NSMenuItem alloc] initWithTitle:@"调节实体亮度…" action:@selector(adjustBrightness:) keyEquivalent:@""];
+            brightness.target = self;
+            brightness.representedObject = @{@"id":@(displayID),@"name":name};
+            [options addItem:brightness];
+        }
+        item.submenu = options; [physicalMenu addItem:item];
     }
     if (!physicalMenu.numberOfItems) [physicalMenu addItemWithTitle:@"未连接真实显示器" action:nil keyEquivalent:@""];
     if (self.mirroredPhysicalDisplay) {
@@ -294,6 +322,11 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     quit.target = NSApp;
     [menu addItem:quit];
     self.statusItem.menu = menu;
+}
+
+- (void)adjustBrightness:(NSMenuItem *)item {
+    if (!self.brightnessController) self.brightnessController = [[BrightnessController alloc] init];
+    [self.brightnessController showForDisplay:[item.representedObject[@"id"] unsignedIntValue] name:item.representedObject[@"name"]];
 }
 
 - (BOOL)automaticUpdateChecksEnabled {

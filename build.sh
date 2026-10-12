@@ -6,15 +6,21 @@ STAGE="$(mktemp -d)/Retina Dummy.app"
 trap 'rm -rf "${STAGE:h}"' EXIT
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 
-VERSION="${VERSION:-0.8.2}"
-BUILD_NUMBER="${BUILD_NUMBER:-13}"
+VERSION="${VERSION:-0.8.3}"
+BUILD_NUMBER="${BUILD_NUMBER:-14}"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:--}"
 
 mkdir -p "${OUT:h}"
 
 clang -arch arm64 -arch x86_64 -Wall -Wextra -fobjc-arc -fmodules -mmacosx-version-min=13.0 \
   -framework Cocoa -framework CoreGraphics -framework ServiceManagement \
-  "$ROOT/main.m" -o "$STAGE/Contents/MacOS/RetinaDummy"
+  "$ROOT/main.m" "$ROOT/BrightnessController.m" -o "$STAGE/Contents/MacOS/RetinaDummy"
+clang -arch arm64 -Wall -Wextra -fmodules -mmacosx-version-min=13.0 -DMAX_DISPLAYS=64 \
+  -I "$ROOT/ThirdParty/m1ddc/headers" -framework CoreDisplay \
+  "$ROOT/BrightnessHelper.m" "$ROOT/ThirdParty/m1ddc/sources/ioregistry.m" "$ROOT/ThirdParty/m1ddc/sources/i2c.m" \
+  -o "$STAGE/Contents/Resources/RetinaBrightness"
+cp "$ROOT/ThirdParty/m1ddc/LICENSE" "$STAGE/Contents/Resources/m1ddc-LICENSE.txt"
+codesign --force --sign "$SIGNING_IDENTITY" "$STAGE/Contents/Resources/RetinaBrightness"
 cp "$ROOT/Info.plist" "$STAGE/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon.icns" "$STAGE/Contents/Resources/AppIcon.icns"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$STAGE/Contents/Info.plist"
