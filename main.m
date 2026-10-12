@@ -90,6 +90,20 @@ static BOOL RuntimeSupportsVirtualDisplays(NSString **error) {
     return YES;
 }
 
+static double MaximumDisplayRefreshRate(CGDirectDisplayID displayID) {
+    double maximum = 0;
+    CFArrayRef modes = CGDisplayCopyAllDisplayModes(displayID, NULL);
+    if (modes) {
+        for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
+            CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+            double rate = CGDisplayModeGetRefreshRate(mode);
+            if (isfinite(rate) && rate > maximum) maximum = rate;
+        }
+        CFRelease(modes);
+    }
+    return maximum;
+}
+
 static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight, NSColor *color) {
     NSTextField *label = [NSTextField labelWithString:text];
     label.font = [NSFont systemFontOfSize:size weight:weight];
@@ -136,7 +150,7 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     NSInteger savedCount = [[NSUserDefaults standardUserDefaults] integerForKey:@"displayCount"];
     self.selectedDisplayCount = (NSUInteger)MAX(1, MIN(3, savedCount ?: 1));
     double savedRefreshRate = [[NSUserDefaults standardUserDefaults] doubleForKey:@"refreshRate"];
-    const double supportedRates[] = {30, 60, 75, 90, 120, 144};
+    const double supportedRates[] = {30, 60, 75, 90, 120, 144, 165};
     self.selectedRefreshRate = 60;
     for (NSUInteger i = 0; i < sizeof(supportedRates) / sizeof(supportedRates[0]); i++) {
         if (fabs(savedRefreshRate - supportedRates[i]) < 0.1) self.selectedRefreshRate = supportedRates[i];
@@ -189,8 +203,20 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
         for (NSScreen *screen in NSScreen.screens) {
             if ([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == displayID) name = screen.localizedName;
         }
-        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:name action:nil keyEquivalent:@""];
+        double maximum = MaximumDisplayRefreshRate(displayID);
+        NSString *displayTitle = maximum > 0 ? [NSString stringWithFormat:@"%@ · 最高 %.0f Hz", name, maximum] : [name stringByAppendingString:@" · 刷新率未知"];
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:displayTitle action:nil keyEquivalent:@""];
         NSMenu *options = [[NSMenu alloc] init];
+        NSMenuItem *rateInfo = [[NSMenuItem alloc] initWithTitle:(maximum > 0 ? [NSString stringWithFormat:@"当前连接可用模式最高：%.0f Hz", maximum] : @"macOS 未提供固定刷新率") action:nil keyEquivalent:@""];
+        rateInfo.enabled = NO; [options addItem:rateInfo];
+        CGDisplayModeRef currentMode = CGDisplayCopyDisplayMode(displayID);
+        if (currentMode) {
+            double currentRate = CGDisplayModeGetRefreshRate(currentMode);
+            NSString *currentText = currentRate > 0 ? [NSString stringWithFormat:@"当前：%zu × %zu · %.0f Hz", CGDisplayModeGetPixelWidth(currentMode), CGDisplayModeGetPixelHeight(currentMode), currentRate] : @"当前刷新率：未知 / 可变";
+            NSMenuItem *currentInfo = [[NSMenuItem alloc] initWithTitle:currentText action:nil keyEquivalent:@""];
+            currentInfo.enabled = NO; [options addItem:currentInfo]; CFRelease(currentMode);
+        }
+        [options addItem:[NSMenuItem separatorItem]];
         NSMenuItem *mirror = [[NSMenuItem alloc] initWithTitle:@"使用当前 HiDPI 设置" action:@selector(enablePhysicalHiDPI:) keyEquivalent:@""];
         mirror.target = self; mirror.representedObject = @(displayID);
         mirror.state = self.mirroredPhysicalDisplay == displayID ? NSControlStateValueOn : NSControlStateValueOff;
@@ -492,7 +518,7 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     NSTextField *refreshLabel = [NSTextField labelWithString:@"刷新率"];
     refreshLabel.frame = NSMakeRect(0, 8, 62, 24);
     NSPopUpButton *refreshPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(68, 4, 160, 30) pullsDown:NO];
-    const NSInteger rates[] = {30, 60, 75, 90, 120, 144};
+    const NSInteger rates[] = {30, 60, 75, 90, 120, 144, 165};
     for (NSUInteger i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
         [refreshPopup addItemWithTitle:[NSString stringWithFormat:@"%ld Hz", (long)rates[i]]];
         refreshPopup.lastItem.tag = rates[i];

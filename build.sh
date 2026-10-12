@@ -6,8 +6,8 @@ STAGE="$(mktemp -d)/Retina Dummy.app"
 trap 'rm -rf "${STAGE:h}"' EXIT
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 
-VERSION="${VERSION:-0.8.0}"
-BUILD_NUMBER="${BUILD_NUMBER:-11}"
+VERSION="${VERSION:-0.8.1}"
+BUILD_NUMBER="${BUILD_NUMBER:-12}"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:--}"
 
 mkdir -p "${OUT:h}"
