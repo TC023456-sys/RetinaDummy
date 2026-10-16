@@ -108,8 +108,11 @@ NOTARY_PROFILE="retina-dummy-notary" \
 
 硬件通信使用 [waydabber/m1ddc](https://github.com/waydabber/m1ddc) 的 MIT 许可代码，署名和许可证见 `ThirdParty/m1ddc/`，应用也附带许可证。后台通信有超时限制；断连后会校验显示器标识，避免写入另一台屏幕。应用启动和退出不会自动改变硬件亮度。
 
+
 ## 自愿赞赏
 
 好用的话，请我喝杯咖啡 ☕
+
+<p><img src="wechat-donation.png" alt="微信赞赏码" width="220"></p>
 
 软件免费使用，赞赏完全自愿，不影响功能，也不附带额外服务承诺。
