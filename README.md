@@ -107,3 +107,9 @@ NOTARY_PROFILE="retina-dummy-notary" \
 当前实现面向 Apple 芯片 Mac 的 DDC/CI 兼容外接屏，不需要 BetterDisplay，不要求屏幕录制权限。Intel Mac 暂不支持此功能。显示器、HDMI/USB-C/DisplayPort 连接及转接设备必须支持 DDC/CI；未响应时界面会明确提示并禁用滑块，不会自动改用软件调暗。当前 ARZOPA 接 Apple M4 HDMI 直连的读取测试失败，不能宣称此屏已支持调节；请检查实体菜单的 DDC/CI 开关、连接和型号兼容性。
 
 硬件通信使用 [waydabber/m1ddc](https://github.com/waydabber/m1ddc) 的 MIT 许可代码，署名和许可证见 `ThirdParty/m1ddc/`，应用也附带许可证。后台通信有超时限制；断连后会校验显示器标识，避免写入另一台屏幕。应用启动和退出不会自动改变硬件亮度。
+
+## 自愿赞赏
+
+好用的话，请我喝杯咖啡 ☕
+
+软件免费使用，赞赏完全自愿，不影响功能，也不附带额外服务承诺。
