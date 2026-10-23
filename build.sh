@@ -1,13 +1,13 @@
 #!/bin/zsh
 set -euo pipefail
 ROOT="${0:A:h}"
-OUT="$ROOT/../../outputs/Retina Dummy.app"
+OUT="${OUTPUT_DIR:-$ROOT/../../outputs}/Retina Dummy.app"
 STAGE="$(mktemp -d)/Retina Dummy.app"
 trap 'rm -rf "${STAGE:h}"' EXIT
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 
-VERSION="${VERSION:-0.8.4}"
-BUILD_NUMBER="${BUILD_NUMBER:-15}"
+VERSION="${VERSION:-0.8.7}"
+BUILD_NUMBER="${BUILD_NUMBER:-18}"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:--}"
 
 mkdir -p "${OUT:h}"
@@ -32,7 +32,7 @@ else
 fi
 codesign --verify --deep --strict --verbose=2 "$STAGE"
 plutil -lint "$STAGE/Contents/Info.plist"
-rm -rf "$OUT" "$ROOT/../../outputs/Retina-Dummy.zip"
+rm -rf "$OUT" "${OUT:h}/Retina-Dummy.zip"
 ditto "$STAGE" "$OUT"
-ditto -c -k --sequesterRsrc --keepParent "$STAGE" "$ROOT/../../outputs/Retina-Dummy.zip"
+ditto -c -k --sequesterRsrc --keepParent "$STAGE" "${OUT:h}/Retina-Dummy.zip"
 echo "$OUT"

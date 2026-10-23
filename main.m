@@ -141,6 +141,9 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 @property(nonatomic, strong) NSMutableArray<CGVirtualDisplay *> *displays;
 @property(nonatomic) NSUInteger selectedProfile;
 @property(nonatomic) NSUInteger selectedDisplayCount;
+@property(nonatomic) BOOL preferPhysicalDisplays;
+@property(nonatomic) BOOL displayManagementEnabled;
+@property(nonatomic) NSUInteger displayChangeGeneration;
 @property(nonatomic) unsigned int customLogicalWidth;
 @property(nonatomic) unsigned int customLogicalHeight;
 @property(nonatomic) double selectedRefreshRate;
@@ -158,7 +161,18 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 - (void)restartDisplaysIfActive;
 - (void)showResolutionPicker:(id)sender;
 - (void)restoreLoginItemIfRequested;
+- (NSUInteger)physicalDisplayCount;
+- (NSMutableArray<CGVirtualDisplay *> *)createVirtualDisplays:(NSUInteger)desired;
+- (void)scheduleDisplayReconciliation;
 @end
+
+static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void *context) {
+    (void)display;
+    if (flags & kCGDisplayBeginConfigurationFlag) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [(__bridge AppDelegate *)context scheduleDisplayReconciliation];
+    });
+}
 
 @implementation AppDelegate
 
@@ -176,6 +190,9 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     if ([saved isEqualToString:@"custom-hidpi"]) self.selectedProfile = kProfileCount;
     NSInteger savedCount = [[NSUserDefaults standardUserDefaults] integerForKey:@"displayCount"];
     self.selectedDisplayCount = (NSUInteger)MAX(1, MIN(3, savedCount ?: 1));
+    NSUserDefaults *settings = NSUserDefaults.standardUserDefaults;
+    self.preferPhysicalDisplays = [settings objectForKey:@"preferPhysicalDisplays"] == nil || [settings boolForKey:@"preferPhysicalDisplays"];
+    self.displayManagementEnabled = YES;
     double savedRefreshRate = [[NSUserDefaults standardUserDefaults] doubleForKey:@"refreshRate"];
     const double supportedRates[] = {30, 60, 75, 90, 120, 144, 165};
     self.selectedRefreshRate = 60;
@@ -191,6 +208,8 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     }
     [self restoreLoginItemIfRequested];
     [self rebuildMenu];
+    CGDisplayRegisterReconfigurationCallback(RetinaDisplayChanged, (__bridge void *)self);
+    [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(displayWake:) name:NSWorkspaceDidWakeNotification object:nil];
     [self startDisplay:nil];
     self.updateTimer = [NSTimer scheduledTimerWithTimeInterval:3600 target:self selector:@selector(checkAutomatically:) userInfo:nil repeats:YES];
     self.updateTimer.tolerance = 60;
@@ -218,6 +237,9 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
         ? [NSString stringWithFormat:@"%lu 个虚拟显示器已开启", (unsigned long)self.displays.count]
         : @"虚拟显示器已关闭";
     NSMenuItem *header = [[NSMenuItem alloc] initWithTitle:headerTitle action:nil keyEquivalent:@""];
+    if (self.preferPhysicalDisplays && self.displayManagementEnabled) {
+        header.title = [NSString stringWithFormat:@"目标 %lu 屏 · 实体 %lu · 虚拟 %lu", (unsigned long)self.selectedDisplayCount, (unsigned long)[self physicalDisplayCount], (unsigned long)self.displays.count];
+    }
     header.enabled = NO;
     [menu addItem:header];
     [menu addItem:[NSMenuItem separatorItem]];
@@ -292,11 +314,16 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     [menu addItem:resolutionItem];
     [menu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem *countItem = [[NSMenuItem alloc] initWithTitle:@"虚拟显示器数量" action:nil keyEquivalent:@""];
+    NSMenuItem *priority = [[NSMenuItem alloc] initWithTitle:@"实体屏优先，按总屏幕数补足" action:@selector(togglePhysicalPriority:) keyEquivalent:@""];
+    priority.target = self;
+    priority.state = self.preferPhysicalDisplays ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:priority];
+    NSString *countTitle = self.preferPhysicalDisplays ? @"目标屏幕总数" : @"虚拟显示器数量";
+    NSMenuItem *countItem = [[NSMenuItem alloc] initWithTitle:countTitle action:nil keyEquivalent:@""];
     NSMenu *countMenu = [[NSMenu alloc] initWithTitle:@"虚拟显示器数量"];
     for (NSUInteger count = 1; count <= 3; count++) {
         NSMenuItem *item = [[NSMenuItem alloc]
-            initWithTitle:[NSString stringWithFormat:@"%lu 个显示器", (unsigned long)count]
+            initWithTitle:[NSString stringWithFormat:(self.preferPhysicalDisplays ? @"总共 %lu 个屏幕" : @"%lu 个虚拟显示器"), (unsigned long)count]
                    action:@selector(selectDisplayCount:)
             keyEquivalent:@""];
         item.target = self;
@@ -308,7 +335,11 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     [menu addItem:countItem];
     [menu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem *toggle = [[NSMenuItem alloc] initWithTitle:(active ? @"关闭虚拟显示器" : @"开启虚拟显示器") action:(active ? @selector(stopDisplay:) : @selector(startDisplay:)) keyEquivalent:@""];
+    NSString *toggleTitle = self.preferPhysicalDisplays
+        ? (self.displayManagementEnabled ? @"暂停自动屏幕管理" : @"启用自动屏幕管理")
+        : (active ? @"关闭虚拟显示器" : @"开启虚拟显示器");
+    BOOL canStop = self.preferPhysicalDisplays ? self.displayManagementEnabled : active;
+    NSMenuItem *toggle = [[NSMenuItem alloc] initWithTitle:toggleTitle action:(canStop ? @selector(stopDisplay:) : @selector(startDisplay:)) keyEquivalent:@""];
     toggle.target = self;
     [menu addItem:toggle];
     NSMenuItem *login = [[NSMenuItem alloc] initWithTitle:@"登录时自动启动" action:@selector(toggleLoginItem:) keyEquivalent:@""];
@@ -693,6 +724,37 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     [self restartDisplaysIfActive];
 }
 
+- (NSUInteger)physicalDisplayCount {
+    CGDirectDisplayID ids[64]; uint32_t count = 0;
+    if (CGGetOnlineDisplayList(64, ids, &count) != kCGErrorSuccess) return NSNotFound;
+    NSUInteger physical = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (CGDisplayVendorNumber(ids[i]) != 0xB33F) physical++;
+    }
+    return physical;
+}
+
+- (void)displayWake:(NSNotification *)notification {
+    (void)notification;
+    [self scheduleDisplayReconciliation];
+}
+
+- (void)scheduleDisplayReconciliation {
+    NSUInteger generation = ++self.displayChangeGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (generation != self.displayChangeGeneration || !self.displayManagementEnabled || !self.preferPhysicalDisplays) return;
+        [self startDisplay:nil];
+    });
+}
+
+- (void)togglePhysicalPriority:(id)sender {
+    (void)sender;
+    self.preferPhysicalDisplays = !self.preferPhysicalDisplays;
+    [NSUserDefaults.standardUserDefaults setBool:self.preferPhysicalDisplays forKey:@"preferPhysicalDisplays"];
+    self.displayManagementEnabled = YES;
+    [self restartDisplaysIfActive];
+}
+
 - (void)selectDisplayCount:(NSMenuItem *)sender {
     self.selectedDisplayCount = (NSUInteger)sender.tag;
     [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)self.selectedDisplayCount forKey:@"displayCount"];
@@ -702,12 +764,12 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 - (void)restartDisplaysIfActive {
     [self restorePhysicalDisplay:nil];
     if (self.mirroredPhysicalDisplay) return;
-    BOOL wasActive = self.displays.count > 0;
+    BOOL wasActive = self.displayManagementEnabled;
     self.displays = nil;
     [self rebuildMenu];
     if (wasActive) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self startDisplay:nil];
+            if (self.displayManagementEnabled) [self startDisplay:nil];
         });
     }
 }
@@ -730,21 +792,41 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 }
 
 - (void)startDisplay:(id)sender {
-    (void)sender;
-    if (self.displays.count > 0) return;
+    if (sender) self.displayManagementEnabled = YES;
+    if (!self.displayManagementEnabled) return;
+    NSUInteger physical = [self physicalDisplayCount];
+    if (physical == NSNotFound) return; // Preserve the current topology if enumeration fails.
+    NSUInteger desired = self.preferPhysicalDisplays
+        ? (physical >= self.selectedDisplayCount ? 0 : self.selectedDisplayCount - physical)
+        : self.selectedDisplayCount;
+    if (self.displays.count == desired) { [self rebuildMenu]; return; }
+    [self restorePhysicalDisplay:nil];
+    if (self.mirroredPhysicalDisplay) return;
+    self.displays = nil;
+    if (desired == 0) {
+        self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"display" accessibilityDescription:@"正在使用实体屏幕"];
+        [self rebuildMenu];
+        return;
+    }
+    self.displays = [self createVirtualDisplays:desired];
+    self.statusItem.button.image = [NSImage imageWithSystemSymbolName:(self.displays.count ? @"display.2" : @"display") accessibilityDescription:@"Retina Dummy"];
+    [self rebuildMenu];
+}
+
+- (NSMutableArray<CGVirtualDisplay *> *)createVirtualDisplays:(NSUInteger)desired {
     NSString *runtimeError = nil;
     if (!RuntimeSupportsVirtualDisplays(&runtimeError)) {
         [self showError:runtimeError];
-        return;
+        return nil;
     }
 
     DisplayProfile p = [self currentProfile];
     NSMutableArray<CGVirtualDisplay *> *created = [NSMutableArray array];
     Class modeClass = NSClassFromString(@"CGVirtualDisplayMode");
 
-    for (NSUInteger displayIndex = 0; displayIndex < self.selectedDisplayCount; displayIndex++) {
+    for (NSUInteger displayIndex = 0; displayIndex < desired; displayIndex++) {
         CGVirtualDisplayDescriptor *descriptor = [[NSClassFromString(@"CGVirtualDisplayDescriptor") alloc] init];
-        descriptor.name = self.selectedDisplayCount == 1
+        descriptor.name = desired == 1
             ? @"Retina Dummy"
             : [NSString stringWithFormat:@"Retina Dummy %lu", (unsigned long)(displayIndex + 1)];
         descriptor.maxPixelsWide = p.width;
@@ -764,7 +846,7 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
         if (!display) {
             [created removeAllObjects];
             [self showError:[NSString stringWithFormat:@"WindowServer 无法创建第 %lu 个虚拟显示器。", (unsigned long)(displayIndex + 1)]];
-            return;
+            return nil;
         }
 
         NSMutableArray *modes = [NSMutableArray array];
@@ -782,14 +864,12 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
         if (![display applySettings:settings]) {
             [created removeAllObjects];
             [self showError:[NSString stringWithFormat:@"macOS 未接受第 %lu 个显示器的 HiDPI 设置。", (unsigned long)(displayIndex + 1)]];
-            return;
+            return nil;
         }
         [created addObject:display];
     }
 
-    self.displays = created;
-    self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"display.2" accessibilityDescription:@"Retina Dummy 已开启"];
-    [self rebuildMenu];
+    return created;
 }
 
 - (BOOL)configurePhysicalDisplay:(CGDirectDisplayID)display mirror:(CGDirectDisplayID)source {
@@ -815,6 +895,10 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 }
 
 - (void)enablePhysicalHiDPI:(NSMenuItem *)sender {
+    if (self.preferPhysicalDisplays) {
+        [self showError:@"实体屏优先模式不会为高清缩放额外创建屏幕。请先关闭“实体屏优先，按总屏幕数补足”再使用镜像缩放。"];
+        return;
+    }
     CGDirectDisplayID target = [sender.representedObject unsignedIntValue];
     if (!CGDisplayIsOnline(target)) { [self showError:@"显示器已断开，请重新打开菜单。"]; return; }
     NSAlert *alert = [[NSAlert alloc] init];
@@ -836,7 +920,7 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 }
 
 - (void)stopDisplay:(id)sender {
-    (void)sender;
+    if (sender) self.displayManagementEnabled = NO;
     [self restorePhysicalDisplay:nil];
     if (self.mirroredPhysicalDisplay) return;
     self.displays = nil;
@@ -848,6 +932,10 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     (void)sender;
     [self restorePhysicalDisplay:nil];
     if (self.mirroredPhysicalDisplay) return NSTerminateCancel;
+    self.displayManagementEnabled = NO;
+    ++self.displayChangeGeneration;
+    CGDisplayRemoveReconfigurationCallback(RetinaDisplayChanged, (__bridge void *)self);
+    [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:self];
     self.displays = nil;
     [self.updateTimer invalidate];
     self.updateTimer = nil;
