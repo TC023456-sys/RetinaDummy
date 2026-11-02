@@ -60,22 +60,28 @@
 }
 - (NSView *)menuViewForDisplay:(CGDirectDisplayID)displayID name:(NSString *)name {
     [self prepareForDisplay:displayID];
-    if (!self.menuView) {
-        self.menuView = [[NSView alloc] initWithFrame:NSMakeRect(0,0,320,144)];
+    // NSMenu owns the attachment/lifecycle of its custom item view. Reusing
+    // one view while rebuilding two menus transfers it out of the old item
+    // during tracking and can leave an empty reserved row. Each item gets a
+    // fresh view; the controller alone retains the shared hardware state.
+    {
+        self.menuView = [[NSView alloc] initWithFrame:NSMakeRect(0,0,320,110)];
         self.menuTitle = [NSTextField labelWithString:@""];
         self.menuTitle.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
-        self.menuTitle.frame = NSMakeRect(16,116,288,20);
-        self.menuSlider = [NSSlider sliderWithValue:50 minValue:0 maxValue:100 target:self action:@selector(sliderChanged:)];
+        self.menuTitle.frame = NSMakeRect(16,84,288,20);
+        self.menuSlider = [NSSlider sliderWithValue:self.slider.doubleValue minValue:0 maxValue:100 target:self action:@selector(sliderChanged:)];
+        self.menuSlider.enabled = self.slider.enabled && !self.busy;
         self.menuSlider.continuous = NO;
-        self.menuSlider.frame = NSMakeRect(16,86,288,24);
+        self.menuSlider.frame = NSMakeRect(16,56,288,24);
         self.menuSlider.accessibilityLabel = [name stringByAppendingString:@" 实体亮度"];
-        self.menuStatus = [NSTextField wrappingLabelWithString:@"正在读取硬件亮度…"];
+        self.menuStatus = [NSTextField wrappingLabelWithString:self.status.stringValue.length ? self.status.stringValue : @"正在读取硬件亮度…"];
         self.menuStatus.font = [NSFont systemFontOfSize:11];
         self.menuStatus.textColor = NSColor.secondaryLabelColor;
-        self.menuStatus.frame = NSMakeRect(16,38,288,42);
+        self.menuStatus.frame = NSMakeRect(16,8,190,42);
         self.menuRefresh = [NSButton buttonWithTitle:@"重新读取" target:self action:@selector(refreshClicked:)];
         self.menuRefresh.bezelStyle = NSBezelStyleRounded;
-        self.menuRefresh.frame = NSMakeRect(12,6,100,28);
+        self.menuRefresh.frame = NSMakeRect(212,14,96,28);
+        self.menuRefresh.enabled = !self.busy;
         for (NSView *view in @[self.menuTitle,self.menuSlider,self.menuStatus,self.menuRefresh]) [self.menuView addSubview:view];
     }
     self.menuTitle.stringValue = [name stringByAppendingString:@" · 亮度"];
@@ -86,14 +92,6 @@
     self.status.stringValue = message;
     self.menuStatus.stringValue = message;
     self.menuStatus.toolTip = message;
-}
-- (void)showForDisplay:(CGDirectDisplayID)displayID name:(NSString *)name {
-    [self prepareForDisplay:displayID];
-    self.window.title = [NSString stringWithFormat:@"%@ · 实体亮度",name];
-    [self.window center];
-    [self showWindow:nil];
-    [NSApp activateIgnoringOtherApps:YES];
-    [self refreshClicked:nil];
 }
 - (void)refreshClicked:(id)sender { (void)sender; [self runCommand:@"--probe" value:nil]; }
 - (void)sliderChanged:(NSSlider *)sender { [self runCommand:@"--set" value:@(sender.doubleValue)]; }
