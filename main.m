@@ -4,8 +4,11 @@
 #import <objc/runtime.h>
 #import <math.h>
 #import <dlfcn.h>
+#import <IOKit/graphics/IOGraphicsTypes.h>
 #import "UpdateCheck.h"
 #import "BrightnessController.h"
+#import "DisplayModePolicy.h"
+#import "NativeDisplayModes.h"
 
 @interface CGVirtualDisplayDescriptor : NSObject
 @property(nonatomic, copy) NSString *name;
@@ -111,20 +114,6 @@ static NSString *PhysicalDisplayName(CGDirectDisplayID displayID) {
     return [NSString stringWithFormat:@"显示器 %u", displayID];
 }
 
-static double MaximumDisplayRefreshRate(CGDirectDisplayID displayID) {
-    double maximum = 0;
-    CFArrayRef modes = CGDisplayCopyAllDisplayModes(displayID, NULL);
-    if (modes) {
-        for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
-            CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
-            double rate = CGDisplayModeGetRefreshRate(mode);
-            if (isfinite(rate) && rate > maximum) maximum = rate;
-        }
-        CFRelease(modes);
-    }
-    return maximum;
-}
-
 static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight, NSColor *color) {
     NSTextField *label = [NSTextField labelWithString:text];
     label.font = [NSFont systemFontOfSize:size weight:weight];
@@ -136,7 +125,7 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
     return label;
 }
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSMenuDelegate, NSTextFieldDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, strong) NSMutableArray<CGVirtualDisplay *> *displays;
 @property(nonatomic) NSUInteger selectedProfile;
@@ -154,16 +143,62 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 @property(nonatomic) BOOL manualUpdateRequested;
 @property(nonatomic, strong) NSTimer *updateTimer;
 @property(nonatomic, strong) NSMutableDictionary<NSNumber *,BrightnessController *> *brightnessControllers;
+@property(nonatomic) BOOL unifiedSettingsEnabled;
+@property(nonatomic) BOOL applyingDisplaySettings;
+@property(nonatomic, copy) NSString *displaySettingsIssue;
+@property(nonatomic, copy) NSString *failedSettingsSignature;
+@property(nonatomic, copy) NSString *failedVirtualCreationSignature;
+@property(nonatomic) BOOL suspendSavedSettings;
+@property(nonatomic) BOOL reconcilingDisplays;
+@property(nonatomic) BOOL displayReconciliationPending;
+@property(nonatomic, weak) NSPopUpButton *settingsResolutionPopup;
+@property(nonatomic, weak) NSPopUpButton *settingsRefreshPopup;
+@property(nonatomic, weak) NSTextField *settingsRefreshHint;
+@property(nonatomic, weak) NSTextField *settingsCustomWidth;
+@property(nonatomic, weak) NSTextField *settingsCustomHeight;
+@property(nonatomic, weak) NSPopUpButton *nativeFormatPopup;
+@property(nonatomic, weak) NSPopUpButton *nativeRatePopup;
+@property(nonatomic, weak) NSButton *nativeApplyButton;
+@property(nonatomic) unsigned int physicalPixelWidth;
+@property(nonatomic) unsigned int physicalPixelHeight;
+@property(nonatomic) BOOL lastSettingsApplyKept;
+@property(nonatomic) BOOL virtualMirrorEnabled;
+@property(nonatomic) BOOL mirrorConfigurationConfirmed;
+@property(nonatomic, strong) NSMutableDictionary<NSNumber *, NSDictionary *> *mirrorOriginals;
+- (void)applyVirtualMirrorProfile:(NSUInteger)profile width:(unsigned int)width height:(unsigned int)height rate:(double)rate confirm:(BOOL)confirm;
+- (BOOL)restoreVirtualMirrorTargets;
 - (BOOL)automaticUpdateChecksEnabled;
 - (void)checkAutomatically:(id)sender;
 - (void)beginUpdateCheckManual:(BOOL)manual;
 - (DisplayProfile)currentProfile;
 - (void)restartDisplaysIfActive;
 - (void)showResolutionPicker:(id)sender;
+- (void)showCustomResolutionAtRate:(double)rate;
 - (void)restoreLoginItemIfRequested;
 - (NSUInteger)physicalDisplayCount;
 - (NSMutableArray<CGVirtualDisplay *> *)createVirtualDisplays:(NSUInteger)desired;
 - (void)scheduleDisplayReconciliation;
+- (void)flushPendingDisplayReconciliation;
+- (void)enqueueDisplayReconciliationAfter:(NSTimeInterval)delay generation:(NSUInteger)generation;
+- (void)performDisplayReconciliationForGeneration:(NSUInteger)generation;
+- (NSArray<NSNumber *> *)physicalDisplayIDs;
+- (void)applyUnifiedSettingsProfile:(NSUInteger)profile width:(unsigned int)width height:(unsigned int)height rate:(double)rate;
+- (void)applySavedSettingsToActiveDisplays;
+- (NSArray<NSDictionary *> *)publicNativeFormatsForDisplay:(CGDirectDisplayID)display;
+- (NSArray<NSDictionary *> *)hiddenNativeFormatsForDisplay:(CGDirectDisplayID)display;
+- (void)applyPhysicalFormat:(NSDictionary *)format physical:(NSArray<NSNumber *> *)physical rate:(double)rate;
+- (BOOL)selectSavedNativeFormatInPopup:(NSPopUpButton *)popup desktopSize:(NSSize)desktop rotation:(double)rotation;
+- (NSDictionary *)hiddenNativePlanForDisplays:(NSArray<NSNumber *> *)ids
+    width:(unsigned int)width height:(unsigned int)height
+    pixelWidth:(unsigned int)pixelWidth pixelHeight:(unsigned int)pixelHeight
+    rate:(double)rate error:(NSString **)error;
+- (BOOL)applyHiddenNativePlan:(NSDictionary *)plan error:(NSString **)error;
+- (BOOL)hiddenNativePlanIsCurrent:(NSDictionary *)plan error:(NSString **)error;
+- (BOOL)restoreHiddenNativePlan:(NSDictionary *)plan error:(NSString **)error;
+- (BOOL)restoreHiddenNativeModesForDisplays:(NSArray<NSNumber *> *)ids
+    width:(unsigned int)width height:(unsigned int)height
+    pixelWidth:(unsigned int)pixelWidth pixelHeight:(unsigned int)pixelHeight
+    rate:(double)rate error:(NSString **)error;
 @end
 
 static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void *context) {
@@ -174,7 +209,37 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
     });
 }
 
+static NSUInteger RDDesiredVirtualCount(NSUInteger requested,BOOL preferPhysical,NSUInteger physicalCount) {
+    return preferPhysical ? (physicalCount>=requested ? 0 : requested-physicalCount) : requested;
+}
+
+static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSize desktop,double rotation) {
+    if (!width || !height || !isfinite(desktop.width) || !isfinite(desktop.height) || !isfinite(rotation)) return NO;
+    BOOL direct=fabs(desktop.width-width)<0.5 && fabs(desktop.height-height)<0.5;
+    double angle=fmod(fmod(rotation,360)+360,360);
+    BOOL quarterTurn=fabs(angle-90)<0.01 || fabs(angle-270)<0.01;
+    return direct || (quarterTurn && fabs(desktop.width-height)<0.5 && fabs(desktop.height-width)<0.5);
+}
+
 @implementation AppDelegate
+@synthesize applyingDisplaySettings = _applyingDisplaySettings;
+@synthesize reconcilingDisplays = _reconcilingDisplays;
+
+- (void)setApplyingDisplaySettings:(BOOL)applying {
+    _applyingDisplaySettings = applying;
+    if (!applying) [self flushPendingDisplayReconciliation];
+}
+
+- (void)setReconcilingDisplays:(BOOL)reconciling {
+    _reconcilingDisplays = reconciling;
+    if (!reconciling) [self flushPendingDisplayReconciliation];
+}
+
+- (void)flushPendingDisplayReconciliation {
+    if (!self.displayReconciliationPending || self.applyingDisplaySettings || self.reconcilingDisplays) return;
+    self.displayReconciliationPending = NO;
+    if (self.displayManagementEnabled) [self scheduleDisplayReconciliation];
+}
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
@@ -193,12 +258,21 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
     NSUserDefaults *settings = NSUserDefaults.standardUserDefaults;
     self.preferPhysicalDisplays = [settings objectForKey:@"preferPhysicalDisplays"] == nil || [settings boolForKey:@"preferPhysicalDisplays"];
     self.displayManagementEnabled = YES;
-    double savedRefreshRate = [[NSUserDefaults standardUserDefaults] doubleForKey:@"refreshRate"];
-    const double supportedRates[] = {30, 60, 75, 90, 120, 144, 165};
-    self.selectedRefreshRate = 60;
-    for (NSUInteger i = 0; i < sizeof(supportedRates) / sizeof(supportedRates[0]); i++) {
-        if (fabs(savedRefreshRate - supportedRates[i]) < 0.1) self.selectedRefreshRate = supportedRates[i];
+    // Old virtual-only preferences are not silently applied to hardware on upgrade.
+    self.unifiedSettingsEnabled = [settings boolForKey:@"unifiedDisplaySettingsEnabled"];
+    self.virtualMirrorEnabled = [settings objectForKey:@"virtualMirrorEnabled"] == nil || [settings boolForKey:@"virtualMirrorEnabled"];
+    self.mirrorConfigurationConfirmed = [settings boolForKey:@"mirrorConfigurationConfirmed"];
+    // An in-place UI-only update can restart the app while the user's live
+    // display differs from saved settings. Consume this installer flag once;
+    // an explicit Apply still clears suspendSavedSettings as usual.
+    if ([settings boolForKey:@"preserveCurrentDisplayModesOnce"]) {
+        self.suspendSavedSettings=YES;
+        [settings removeObjectForKey:@"preserveCurrentDisplayModesOnce"];
     }
+    self.physicalPixelWidth = (unsigned int)MAX(0, [settings integerForKey:@"physicalPixelWidth"]);
+    self.physicalPixelHeight = (unsigned int)MAX(0, [settings integerForKey:@"physicalPixelHeight"]);
+    double savedRefreshRate = [[NSUserDefaults standardUserDefaults] doubleForKey:@"refreshRate"];
+    self.selectedRefreshRate = isfinite(savedRefreshRate) && savedRefreshRate >= 1 && savedRefreshRate <= 1000 ? savedRefreshRate : 60;
 
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
     self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"display" accessibilityDescription:@"Retina Dummy"];
@@ -219,18 +293,21 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
 - (void)menuNeedsUpdate:(NSMenu *)menu {
     (void)menu;
     [self rebuildMenu];
-    NSMenu *updated = self.statusItem.menu;
-    if (updated != menu) {
-        [menu removeAllItems];
-        for (NSMenuItem *item in [updated.itemArray copy]) {
-            [updated removeItem:item]; [menu addItem:item];
-        }
-        self.statusItem.menu = menu;
-    }
+}
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)visible {
+    (void)sender; (void)visible;
+    if (NSApp.modalWindow) [NSApp.modalWindow makeKeyAndOrderFront:nil];
+    else dispatch_async(dispatch_get_main_queue(), ^{ [self showResolutionPicker:nil]; });
+    return NO;
 }
 
 - (void)rebuildMenu {
-    NSMenu *menu = [[NSMenu alloc] init];
+    // Update the menu AppKit is about to display in place. Replacing the
+    // status menu and transferring custom-view items during tracking can
+    // detach their view hierarchy while retaining the row's reserved height.
+    NSMenu *menu = self.statusItem.menu ?: [[NSMenu alloc] init];
+    [menu removeAllItems];
     menu.delegate = self;
     BOOL active = self.displays.count > 0;
     NSString *headerTitle = active
@@ -241,40 +318,21 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
         header.title = [NSString stringWithFormat:@"目标 %lu 屏 · 实体 %lu · 虚拟 %lu", (unsigned long)self.selectedDisplayCount, (unsigned long)[self physicalDisplayCount], (unsigned long)self.displays.count];
     }
     header.enabled = NO;
+    if (self.virtualMirrorEnabled) header.title = [NSString stringWithFormat:@"虚拟高清 · 实体 %lu · 虚拟 %lu",(unsigned long)[self physicalDisplayCount],(unsigned long)self.displays.count];
     [menu addItem:header];
     [menu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem *physical = [[NSMenuItem alloc] initWithTitle:@"真实显示器高清缩放" action:nil keyEquivalent:@""];
-    NSMenu *physicalMenu = [[NSMenu alloc] init];
     uint32_t count = 0; CGDirectDisplayID ids[64];
     CGGetOnlineDisplayList(64, ids, &count);
     if (!self.brightnessControllers) self.brightnessControllers = [NSMutableDictionary dictionary];
     NSMutableSet<NSNumber *> *connectedBrightnessDisplays = [NSMutableSet set];
     for (uint32_t i = 0; i < count; i++) {
         CGDirectDisplayID displayID = ids[i];
-        if (CGDisplayVendorNumber(displayID) == 0xB33F) continue;
+        if (!RDIsPhysicalDisplay(CGDisplayVendorNumber(displayID), CGDisplayModelNumber(displayID))) continue;
         NSString *name = PhysicalDisplayName(displayID);
         for (NSScreen *screen in NSScreen.screens) {
             if ([screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue] == displayID) name = screen.localizedName;
         }
-        double maximum = MaximumDisplayRefreshRate(displayID);
-        NSString *displayTitle = maximum > 0 ? [NSString stringWithFormat:@"%@ · 最高 %.0f Hz", name, maximum] : [name stringByAppendingString:@" · 刷新率未知"];
-        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:displayTitle action:nil keyEquivalent:@""];
-        NSMenu *options = [[NSMenu alloc] init];
-        NSMenuItem *rateInfo = [[NSMenuItem alloc] initWithTitle:(maximum > 0 ? [NSString stringWithFormat:@"当前连接可用模式最高：%.0f Hz", maximum] : @"macOS 未提供固定刷新率") action:nil keyEquivalent:@""];
-        rateInfo.enabled = NO; [options addItem:rateInfo];
-        CGDisplayModeRef currentMode = CGDisplayCopyDisplayMode(displayID);
-        if (currentMode) {
-            double currentRate = CGDisplayModeGetRefreshRate(currentMode);
-            NSString *currentText = currentRate > 0 ? [NSString stringWithFormat:@"当前：%zu × %zu · %.0f Hz", CGDisplayModeGetPixelWidth(currentMode), CGDisplayModeGetPixelHeight(currentMode), currentRate] : @"当前刷新率：未知 / 可变";
-            NSMenuItem *currentInfo = [[NSMenuItem alloc] initWithTitle:currentText action:nil keyEquivalent:@""];
-            currentInfo.enabled = NO; [options addItem:currentInfo]; CFRelease(currentMode);
-        }
-        [options addItem:[NSMenuItem separatorItem]];
-        NSMenuItem *mirror = [[NSMenuItem alloc] initWithTitle:@"使用当前 HiDPI 设置" action:@selector(enablePhysicalHiDPI:) keyEquivalent:@""];
-        mirror.target = self; mirror.representedObject = @(displayID);
-        mirror.state = self.mirroredPhysicalDisplay == displayID ? NSControlStateValueOn : NSControlStateValueOff;
-        [options addItem:mirror];
         if (!CGDisplayIsBuiltin(displayID)) {
             NSNumber *key = @(displayID);
             [connectedBrightnessDisplays addObject:key];
@@ -287,43 +345,39 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
             inlineBrightness.view = [controller menuViewForDisplay:displayID name:name];
             [menu addItem:inlineBrightness];
             [menu addItem:[NSMenuItem separatorItem]];
-            NSMenuItem *brightness = [[NSMenuItem alloc] initWithTitle:@"调节实体亮度…" action:@selector(adjustBrightness:) keyEquivalent:@""];
-            brightness.target = self;
-            brightness.representedObject = @{@"id":@(displayID),@"name":name};
-            [options addItem:brightness];
         }
-        item.submenu = options; [physicalMenu addItem:item];
     }
     for (NSNumber *key in self.brightnessControllers.allKeys) {
         if (![connectedBrightnessDisplays containsObject:key]) [self.brightnessControllers removeObjectForKey:key];
     }
-    if (!physicalMenu.numberOfItems) [physicalMenu addItemWithTitle:@"未连接真实显示器" action:nil keyEquivalent:@""];
     if (self.mirroredPhysicalDisplay) {
-        [physicalMenu addItem:[NSMenuItem separatorItem]];
         NSMenuItem *restore = [[NSMenuItem alloc] initWithTitle:@"恢复原来的镜像设置" action:@selector(restorePhysicalDisplay:) keyEquivalent:@""];
-        restore.target = self; [physicalMenu addItem:restore];
+        restore.target = self; [menu addItem:restore];
     }
-    physical.submenu = physicalMenu; [menu addItem:physical];
-    [menu addItem:[NSMenuItem separatorItem]];
     DisplayProfile currentProfile = [self currentProfile];
     NSMenuItem *resolutionItem = [[NSMenuItem alloc]
-        initWithTitle:[NSString stringWithFormat:@"HiDPI 设置…   %u × %u @ %.0fHz", currentProfile.logicalWidth, currentProfile.logicalHeight, self.selectedRefreshRate]
+        initWithTitle:[NSString stringWithFormat:@"统一显示设置…   %u × %u @ %.0fHz%@", currentProfile.logicalWidth, currentProfile.logicalHeight, self.selectedRefreshRate, self.unifiedSettingsEnabled ? @"" : @"（待应用）"]
                action:@selector(showResolutionPicker:)
         keyEquivalent:@""];
     resolutionItem.target = self;
     [menu addItem:resolutionItem];
+    if (self.displaySettingsIssue.length) {
+        NSMenuItem *issue = [[NSMenuItem alloc] initWithTitle:@"查看显示状态…" action:@selector(showDisplaySettingsIssue:) keyEquivalent:@""];
+        issue.target = self; [menu addItem:issue];
+    }
     [menu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem *priority = [[NSMenuItem alloc] initWithTitle:@"实体屏优先，按总屏幕数补足" action:@selector(togglePhysicalPriority:) keyEquivalent:@""];
     priority.target = self;
     priority.state = self.preferPhysicalDisplays ? NSControlStateValueOn : NSControlStateValueOff;
+    if (self.virtualMirrorEnabled) { priority.title=@"虚拟高清画面 → 实体屏幕"; priority.action=nil; priority.enabled=NO; priority.state=NSControlStateValueOff; }
     [menu addItem:priority];
-    NSString *countTitle = self.preferPhysicalDisplays ? @"目标屏幕总数" : @"虚拟显示器数量";
+    NSString *countTitle = self.preferPhysicalDisplays && !self.virtualMirrorEnabled ? @"目标屏幕总数" : @"虚拟显示器数量";
     NSMenuItem *countItem = [[NSMenuItem alloc] initWithTitle:countTitle action:nil keyEquivalent:@""];
     NSMenu *countMenu = [[NSMenu alloc] initWithTitle:@"虚拟显示器数量"];
     for (NSUInteger count = 1; count <= 3; count++) {
         NSMenuItem *item = [[NSMenuItem alloc]
-            initWithTitle:[NSString stringWithFormat:(self.preferPhysicalDisplays ? @"总共 %lu 个屏幕" : @"%lu 个虚拟显示器"), (unsigned long)count]
+            initWithTitle:[NSString stringWithFormat:(self.preferPhysicalDisplays && !self.virtualMirrorEnabled ? @"总共 %lu 个屏幕" : @"%lu 个虚拟显示器"), (unsigned long)count]
                    action:@selector(selectDisplayCount:)
             keyEquivalent:@""];
         item.target = self;
@@ -371,9 +425,14 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
     self.statusItem.menu = menu;
 }
 
-- (void)adjustBrightness:(NSMenuItem *)item {
-    BrightnessController *controller = self.brightnessControllers[item.representedObject[@"id"]];
-    [controller showForDisplay:[item.representedObject[@"id"] unsignedIntValue] name:item.representedObject[@"name"]];
+- (void)showDisplaySettingsIssue:(id)sender {
+    (void)sender;
+    if (!self.displaySettingsIssue.length) return;
+    NSAlert *alert=[NSAlert new];
+    alert.messageText=@"显示状态";
+    alert.informativeText=self.displaySettingsIssue;
+    [alert addButtonWithTitle:@"好"];
+    [alert runModal];
 }
 
 - (BOOL)automaticUpdateChecksEnabled {
@@ -405,6 +464,7 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
 }
 
 - (void)beginUpdateCheckManual:(BOOL)manual {
+    if (self.applyingDisplaySettings) return;
     if (manual) self.manualUpdateRequested = YES;
     if (self.checkingUpdate) return;
     self.checkingUpdate = YES; [self rebuildMenu];
@@ -420,6 +480,7 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
             BOOL requestedManually = self.manualUpdateRequested;
             self.manualUpdateRequested = NO;
             self.checkingUpdate = NO; [self rebuildMenu];
+            if (self.applyingDisplaySettings) return; // Do not nest an updater alert over timed rollback.
             if (error || http.statusCode != 200 || !latest) {
                 if (requestedManually) [self showError:@"检查更新失败，请稍后重试。也可访问 GitHub Releases 下载新版。"];
                 return;
@@ -603,16 +664,20 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
 }
 
 - (void)selectProfile:(NSMenuItem *)sender {
-    self.selectedProfile = (NSUInteger)sender.tag;
-    [[NSUserDefaults standardUserDefaults] setObject:@(kProfiles[self.selectedProfile].key) forKey:@"profile"];
-    [self restartDisplaysIfActive];
+    if (sender.tag < 0 || (NSUInteger)sender.tag >= kProfileCount) return;
+    [self applyUnifiedSettingsProfile:(NSUInteger)sender.tag width:self.customLogicalWidth height:self.customLogicalHeight rate:self.selectedRefreshRate];
 }
 
 - (void)showResolutionPicker:(id)sender {
     (void)sender;
+    NSArray *physical = [self physicalDisplayIDs];
+    if (!physical) { [self showError:@"无法读取当前显示器，未更改设置。"]; return; }
+    if (physical.count && !self.virtualMirrorEnabled) { [self showPhysicalResolutionPicker:physical]; return; }
     NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = @"HiDPI 显示设置";
-    alert.informativeText = @"选择逻辑桌面尺寸和刷新率，内部将以 2× 分辨率渲染。";
+    alert.messageText = @"统一显示设置";
+    CGDirectDisplayID mainDisplay = CGMainDisplayID();
+    alert.informativeText = [NSString stringWithFormat:@"当前使用：虚拟屏幕 · %@\n以下为本应用虚拟屏可配置的 2× HiDPI 格式。切换后 15 秒内确认，否则恢复。", PhysicalDisplayName(mainDisplay)];
+    if (self.virtualMirrorEnabled) alert.informativeText=@"虚拟屏提供 HiDPI 画面，实体屏同步刷新率。切换后 15 秒内确认，否则恢复。";
     [alert addButtonWithTitle:@"应用"];
     [alert addButtonWithTitle:@"取消"];
 
@@ -644,12 +709,6 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
     NSTextField *refreshLabel = [NSTextField labelWithString:@"刷新率"];
     refreshLabel.frame = NSMakeRect(0, 8, 62, 24);
     NSPopUpButton *refreshPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(68, 4, 160, 30) pullsDown:NO];
-    const NSInteger rates[] = {30, 60, 75, 90, 120, 144, 165};
-    for (NSUInteger i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
-        [refreshPopup addItemWithTitle:[NSString stringWithFormat:@"%ld Hz", (long)rates[i]]];
-        refreshPopup.lastItem.tag = rates[i];
-    }
-    [refreshPopup selectItemWithTag:(NSInteger)self.selectedRefreshRate];
     NSTextField *refreshHint = [NSTextField labelWithString:@"高刷新率会增加 GPU 与传输带宽占用"];
     refreshHint.textColor = NSColor.secondaryLabelColor;
     refreshHint.font = [NSFont systemFontOfSize:11];
@@ -660,29 +719,355 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
     [settingsView addSubview:refreshPopup];
     [settingsView addSubview:refreshHint];
     alert.accessoryView = settingsView;
+    self.settingsResolutionPopup = popup;
+    self.settingsRefreshPopup = refreshPopup;
+    self.settingsRefreshHint = refreshHint;
+    popup.target = self;
+    popup.action = @selector(settingsResolutionChanged:);
+    [self settingsResolutionChanged:popup];
 
     if ([alert runModal] != NSAlertFirstButtonReturn) return;
-    self.selectedRefreshRate = (double)refreshPopup.selectedItem.tag;
-    [[NSUserDefaults standardUserDefaults] setDouble:self.selectedRefreshRate forKey:@"refreshRate"];
+    NSArray *nowPhysical = [self physicalDisplayIDs];
+    if (!nowPhysical || (nowPhysical.count && !self.virtualMirrorEnabled)) { [self showError:@"显示器连接已变化，请重新打开显示设置。原设置未更改。"]; return; }
+    double requestedRate = [refreshPopup.selectedItem.representedObject doubleValue];
     NSInteger selection = popup.selectedItem.tag;
     if (selection == -100) {
-        [self showCustomResolution:nil];
+        [self showCustomResolutionAtRate:requestedRate];
         return;
     }
-    self.selectedProfile = (NSUInteger)selection;
-    [[NSUserDefaults standardUserDefaults] setObject:@(kProfiles[self.selectedProfile].key) forKey:@"profile"];
-    [self restartDisplaysIfActive];
+    // Let preflight explain which display/mode is unavailable; never switch
+    // to an arbitrary fallback when the popup has no matching rates.
+    if (requestedRate <= 0) requestedRate = self.selectedRefreshRate;
+    [self applyVirtualProfile:(NSUInteger)selection width:self.customLogicalWidth height:self.customLogicalHeight rate:requestedRate];
 }
 
-- (void)showCustomResolution:(id)sender {
+- (void)applyVirtualProfile:(NSUInteger)profile width:(unsigned int)width height:(unsigned int)height rate:(double)rate {
+    if (self.virtualMirrorEnabled) { [self applyVirtualMirrorProfile:profile width:width height:height rate:rate confirm:YES]; return; }
+    NSArray *physical=[self physicalDisplayIDs];
+    if (!physical || physical.count) { [self showError:@"显示器连接已变化，请重新打开显示设置。原设置未更改。"]; return; }
+    unsigned int oldWidth=self.physicalPixelWidth,oldHeight=self.physicalPixelHeight;
+    self.physicalPixelWidth=0; self.physicalPixelHeight=0;
+    [self applyUnifiedSettingsProfile:profile width:width height:height rate:rate];
+    if (!self.lastSettingsApplyKept) { self.physicalPixelWidth=oldWidth; self.physicalPixelHeight=oldHeight; }
+}
+
+// Native geometry and refresh rates are kept together; normal-density modes
+// must not be mislabeled as HiDPI or filtered out of a physical screen picker.
+- (NSArray<NSDictionary *> *)publicNativeFormatsForDisplay:(CGDirectDisplayID)display {
+    NSMutableArray *formats=[NSMutableArray array];
+    CFArrayRef modes=CGDisplayCopyAllDisplayModes(display,(__bridge CFDictionaryRef)@{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes:@YES});
+    for (id value in (__bridge NSArray *)modes) {
+        CGDisplayModeRef mode=(__bridge CGDisplayModeRef)value;
+        size_t w=CGDisplayModeGetWidth(mode),h=CGDisplayModeGetHeight(mode),pw=CGDisplayModeGetPixelWidth(mode),ph=CGDisplayModeGetPixelHeight(mode);
+        double rate=CGDisplayModeGetRefreshRate(mode);
+        if (!CGDisplayModeIsUsableForDesktopGUI(mode) || w<640 || h<480 || w>5120 || h>4320 || !isfinite(rate) || rate<=0 || rate>1000) continue;
+        [formats addObject:@{@"width":@(w),@"height":@(h),@"pixelWidth":@(pw),@"pixelHeight":@(ph),@"rates":@[@(rate)]}];
+    }
+    if (modes) CFRelease(modes);
+    return formats;
+}
+
+- (NSArray<NSDictionary *> *)hiddenNativeFormatsForDisplay:(CGDirectDisplayID)display {
+    return RDNMHiddenFormatsForDisplay(display);
+}
+
+- (NSArray<NSDictionary *> *)nativeFormatsForDisplays:(NSArray<NSNumber *> *)physical {
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *common = [NSMutableDictionary dictionary];
+    BOOL first = YES;
+    for (NSNumber *display in physical) {
+        NSMutableDictionary<NSString *, NSMutableDictionary *> *formats = [NSMutableDictionary dictionary];
+        NSMutableArray *candidates=[[self publicNativeFormatsForDisplay:display.unsignedIntValue] mutableCopy];
+        if (!candidates) candidates=[NSMutableArray array];
+        if (physical.count==1 && !self.virtualMirrorEnabled && !self.displays.count && !self.mirroredPhysicalDisplay && !self.mirrorOriginals.count && RDDesiredVirtualCount(self.selectedDisplayCount,self.preferPhysicalDisplays,physical.count)==0)
+            [candidates addObjectsFromArray:[self hiddenNativeFormatsForDisplay:display.unsignedIntValue]];
+        for (NSDictionary *candidate in candidates) {
+            NSUInteger w=[candidate[@"width"] unsignedIntegerValue],h=[candidate[@"height"] unsignedIntegerValue],pw=[candidate[@"pixelWidth"] unsignedIntegerValue],ph=[candidate[@"pixelHeight"] unsignedIntegerValue];
+            NSString *key = [NSString stringWithFormat:@"%zu/%zu/%zu/%zu",w,h,pw,ph];
+            if (!formats[key]) formats[key] = [@{@"width":@(w),@"height":@(h),@"pixelWidth":@(pw),@"pixelHeight":@(ph),@"rates":[NSMutableArray array]} mutableCopy];
+            NSMutableArray *rates = formats[key][@"rates"];
+            for (NSNumber *rate in candidate[@"rates"]) {
+                BOOL duplicate=NO;
+                for (NSNumber *existing in rates) if (fabs(existing.doubleValue-rate.doubleValue)<0.01) duplicate=YES;
+                if (!duplicate) [rates addObject:rate];
+            }
+        }
+        if (first) { [common addEntriesFromDictionary:formats]; first = NO; }
+        else for (NSString *key in common.allKeys) {
+            NSMutableArray *rates = common[key][@"rates"];
+            NSArray *other = formats[key][@"rates"] ?: @[];
+            NSIndexSet *unavailable = [rates indexesOfObjectsPassingTest:^BOOL(NSNumber *rate, NSUInteger idx, BOOL *stop) {
+                (void)idx; (void)stop;
+                for (NSNumber *candidate in other) if (fabs(candidate.doubleValue-rate.doubleValue)<0.6) return NO;
+                return YES;
+            }];
+            [rates removeObjectsAtIndexes:unavailable];
+            if (!rates.count) [common removeObjectForKey:key];
+        }
+    }
+    return [common.allValues sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        for (NSString *key in @[@"width",@"height",@"pixelWidth",@"pixelHeight"]) {
+            NSComparisonResult result = [a[key] compare:b[key]];
+            if (result != NSOrderedSame) return result;
+        }
+        return NSOrderedSame;
+    }];
+}
+
+- (void)nativeFormatChanged:(id)sender {
     (void)sender;
+    double previous = [self.nativeRatePopup.selectedItem.representedObject doubleValue];
+    if (previous<=0) previous=self.selectedRefreshRate;
+    [self.nativeRatePopup removeAllItems];
+    NSArray *rates = [self.nativeFormatPopup.selectedItem.representedObject[@"rates"] sortedArrayUsingSelector:@selector(compare:)];
+    self.nativeApplyButton.enabled=rates.count>0;
+    for (NSNumber *rate in rates) {
+        [self.nativeRatePopup addItemWithTitle:[NSString stringWithFormat:@"%g Hz",rate.doubleValue]];
+        self.nativeRatePopup.lastItem.representedObject=rate;
+    }
+    for (NSMenuItem *item in self.nativeRatePopup.itemArray) if (fabs([item.representedObject doubleValue]-previous)<0.6) { [self.nativeRatePopup selectItem:item]; break; }
+}
+
+- (void)populateNativeFormats:(NSArray<NSDictionary *> *)formats inPopup:(NSPopUpButton *)sizes currentMode:(CGDisplayModeRef)current {
+    [sizes removeAllItems];
+    sizes.menu.autoenablesItems=NO;
+    NSMutableArray<NSMutableArray *> *groups=[NSMutableArray arrayWithArray:@[[NSMutableArray array],[NSMutableArray array],[NSMutableArray array]]];
+    for (NSDictionary *format in formats) {
+        NSUInteger w=[format[@"width"] unsignedIntegerValue],h=[format[@"height"] unsignedIntegerValue],pw=[format[@"pixelWidth"] unsignedIntegerValue],ph=[format[@"pixelHeight"] unsignedIntegerValue];
+        NSUInteger group=pw==w && ph==h ? 0 : (pw==w*2 && ph==h*2 ? 1 : 2);
+        [groups[group] addObject:format];
+    }
+    NSArray *titles=@[@"普通",@"HiDPI",@"其他缩放"];
+    NSMenuItem *selected=nil,*firstFormat=nil;
+    for (NSUInteger group=0;group<groups.count;group++) {
+        if (!groups[group].count) continue;
+        if (sizes.numberOfItems) [sizes.menu addItem:NSMenuItem.separatorItem];
+        NSMenuItem *header=[sizes.menu addItemWithTitle:titles[group] action:nil keyEquivalent:@""];
+        header.enabled=NO;
+        NSArray *ordered=[groups[group] sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            for (NSString *key in @[@"width",@"height",@"pixelWidth",@"pixelHeight"]) {
+                NSComparisonResult result=[a[key] compare:b[key]];
+                if (result!=NSOrderedSame) return result;
+            }
+            return NSOrderedSame;
+        }];
+        for (NSDictionary *format in ordered) {
+            unsigned int w=[format[@"width"] unsignedIntValue],h=[format[@"height"] unsignedIntValue],pw=[format[@"pixelWidth"] unsignedIntValue],ph=[format[@"pixelHeight"] unsignedIntValue];
+            NSString *density=group==0 ? @"普通" : (group==1 ? @"HiDPI" : [NSString stringWithFormat:@"渲染 %u × %u",pw,ph]);
+            [sizes addItemWithTitle:[NSString stringWithFormat:@"%u × %u · %@",w,h,density]];
+            NSMenuItem *item=sizes.lastItem;
+            item.representedObject=format; item.enabled=YES; item.indentationLevel=1;
+            if (!firstFormat) firstFormat=item;
+            if (current && CGDisplayModeGetWidth(current)==w && CGDisplayModeGetHeight(current)==h && CGDisplayModeGetPixelWidth(current)==pw && CGDisplayModeGetPixelHeight(current)==ph) selected=item;
+        }
+    }
+    if (selected ?: firstFormat) [sizes selectItem:selected ?: firstFormat];
+}
+
+- (void)showPhysicalResolutionPicker:(NSArray<NSNumber *> *)physical {
+    NSArray *formats = [self nativeFormatsForDisplays:physical];
+    NSAlert *alert = [NSAlert new];
+    alert.messageText = @"统一显示设置";
+    NSMutableArray *names = [NSMutableArray array];
+    for (NSNumber *display in physical) [names addObject:PhysicalDisplayName(display.unsignedIntValue)];
+    BOOL mainPhysical = [physical containsObject:@(CGMainDisplayID())];
+    alert.informativeText = [NSString stringWithFormat:@"当前主屏：%@ · %@\n%@。切换后 15 秒内确认，否则恢复。", mainPhysical ? @"实体屏幕" : @"虚拟屏幕", PhysicalDisplayName(CGMainDisplayID()), physical.count==1 ? [NSString stringWithFormat:@"按实体屏 %@ 的可用格式列出",names.firstObject] : @"按所有实体屏共同可用格式列出"];
+    [alert addButtonWithTitle:@"应用"]; [alert addButtonWithTitle:@"取消"];
+    NSView *view = [[NSView alloc] initWithFrame:NSMakeRect(0,0,420,84)];
+    NSTextField *sizeLabel = [NSTextField labelWithString:@"分辨率"]; sizeLabel.frame=NSMakeRect(0,48,62,24);
+    NSTextField *rateLabel = [NSTextField labelWithString:@"刷新率"]; rateLabel.frame=NSMakeRect(0,8,62,24);
+    NSPopUpButton *sizes = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(68,44,352,30) pullsDown:NO];
+    NSPopUpButton *rates = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(68,4,220,30) pullsDown:NO];
+    CGDirectDisplayID display=physical.firstObject.unsignedIntValue;
+    NSSize desktop=CGDisplayBounds(display).size;double rotation=CGDisplayRotation(display);
+    CGDisplayModeRef current = CGDisplayCopyDisplayMode(display);
+    BOOL consistent=current && RDLogicalSizeMatchesDesktop(CGDisplayModeGetWidth(current),CGDisplayModeGetHeight(current),desktop,rotation);
+    [self populateNativeFormats:formats inPopup:sizes currentMode:consistent?current:NULL];
+    if (!consistent && formats.count) {
+        if ([self selectSavedNativeFormatInPopup:sizes desktopSize:desktop rotation:rotation])
+            alert.informativeText=[alert.informativeText stringByAppendingString:@"\n已按上次保留的格式预选。"];
+        else { [sizes selectItem:nil];alert.informativeText=[alert.informativeText stringByAppendingString:@"\n请选择要应用的格式。"];}
+    }
+    if (!formats.count) { [sizes addItemWithTitle:@"没有共同可用的固定刷新率模式"]; sizes.enabled=NO; alert.buttons.firstObject.enabled=NO; }
+    self.nativeFormatPopup=sizes; self.nativeRatePopup=rates; self.nativeApplyButton=alert.buttons.firstObject;
+    sizes.target=self; sizes.action=@selector(nativeFormatChanged:);
+    [self nativeFormatChanged:nil];
+    if (current) {
+        double hz=consistent?CGDisplayModeGetRefreshRate(current):self.selectedRefreshRate;
+        for (NSMenuItem *item in rates.itemArray) if (fabs([item.representedObject doubleValue]-hz)<0.6) { [rates selectItem:item]; break; }
+        CFRelease(current);
+    }
+    for (NSView *control in @[sizeLabel,rateLabel,sizes,rates]) [view addSubview:control];
+    alert.accessoryView=view;
+    if ([alert runModal]!=NSAlertFirstButtonReturn || !formats.count) return;
+    NSArray *connected=[self physicalDisplayIDs];
+    if (!connected || ![[NSSet setWithArray:connected] isEqualToSet:[NSSet setWithArray:physical]]) {
+        [self showError:@"显示器连接已变化，请重新打开显示设置。原设置未更改。"]; return;
+    }
+    NSDictionary *format=sizes.selectedItem.representedObject;
+    [self applyPhysicalFormat:format physical:physical rate:[rates.selectedItem.representedObject doubleValue]];
+}
+
+- (BOOL)selectSavedNativeFormatInPopup:(NSPopUpButton *)popup desktopSize:(NSSize)desktop rotation:(double)rotation {
+    DisplayProfile saved=[self currentProfile];
+    if (!RDLogicalSizeMatchesDesktop(saved.logicalWidth,saved.logicalHeight,desktop,rotation)) return NO;
+    NSUInteger pw=self.physicalPixelWidth ?: saved.width,ph=self.physicalPixelHeight ?: saved.height;
+    for (NSMenuItem *item in popup.itemArray) {
+        NSDictionary *format=item.representedObject;
+        if ([format[@"width"] unsignedIntegerValue]==saved.logicalWidth && [format[@"height"] unsignedIntegerValue]==saved.logicalHeight && [format[@"pixelWidth"] unsignedIntegerValue]==pw && [format[@"pixelHeight"] unsignedIntegerValue]==ph) {
+            [popup selectItem:item];return YES;
+        }
+    }
+    return NO;
+}
+
+- (NSDictionary *)hiddenNativePlanForDisplays:(NSArray<NSNumber *> *)ids
+    width:(unsigned int)width height:(unsigned int)height
+    pixelWidth:(unsigned int)pixelWidth pixelHeight:(unsigned int)pixelHeight
+    rate:(double)rate error:(NSString **)error {
+    return RDHiddenNativeModePlan(ids,width,height,pixelWidth,pixelHeight,rate,error);
+}
+
+- (BOOL)applyHiddenNativePlan:(NSDictionary *)plan error:(NSString **)error { return RDApplyHiddenNativeModePlan(plan,error); }
+- (BOOL)hiddenNativePlanIsCurrent:(NSDictionary *)plan error:(NSString **)error { return RDNativePlanTargetIsCurrent(plan,error); }
+- (BOOL)restoreHiddenNativePlan:(NSDictionary *)plan error:(NSString **)error { return RDRestoreNativePlanOriginal(plan,error); }
+
+- (void)applyPhysicalFormat:(NSDictionary *)format physical:(NSArray<NSNumber *> *)physical rate:(double)rate {
+    if (self.applyingDisplaySettings || self.reconcilingDisplays) return;
+    self.lastSettingsApplyKept=NO;
+    if (!self.displayManagementEnabled) { [self showError:@"请先启用屏幕管理，再应用显示设置。"]; return; }
+    if (self.virtualMirrorEnabled || self.mirroredPhysicalDisplay || self.mirrorOriginals.count) {
+        [self showError:@"显示布局已变化，请重新打开显示设置。原设置未更改。"]; return;
+    }
+    NSUInteger width=[format[@"width"] unsignedIntegerValue],height=[format[@"height"] unsignedIntegerValue];
+    NSUInteger pixelWidth=[format[@"pixelWidth"] unsignedIntegerValue],pixelHeight=[format[@"pixelHeight"] unsignedIntegerValue];
+    if (width<640 || height<480 || width>5120 || height>4320 || !pixelWidth || !pixelHeight || pixelWidth>32768 || pixelHeight>32768 || !isfinite(rate) || rate<=0 || rate>1000) {
+        [self showError:@"显示格式参数无效，原设置未更改。"]; return;
+    }
+    if (!physical.count || ![self topologyMatchesPhysical:physical virtualIDs:[self IDsForVirtualDisplays:self.displays]]) {
+        [self showError:@"显示器连接已变化，请重新打开显示设置。原设置未更改。"]; return;
+    }
+    unsigned int oldPixelWidth=self.physicalPixelWidth,oldPixelHeight=self.physicalPixelHeight;
+    BOOL independentPhysical=physical.count==1 && !self.virtualMirrorEnabled && !self.displays.count && !self.mirroredPhysicalDisplay && !self.mirrorOriginals.count && RDDesiredVirtualCount(self.selectedDisplayCount,self.preferPhysicalDisplays,physical.count)==0;
+    self.physicalPixelWidth=(unsigned int)pixelWidth; self.physicalPixelHeight=(unsigned int)pixelHeight;
+    NSString *error=nil;
+    NSDictionary *publicPlan=[self modePlanForDisplays:physical width:(unsigned int)width height:(unsigned int)height rate:rate error:&error];
+    if (publicPlan && !independentPhysical) {
+        [self applyUnifiedSettingsProfile:kProfileCount width:(unsigned int)width height:(unsigned int)height rate:rate];
+        if (!self.lastSettingsApplyKept) { self.physicalPixelWidth=oldPixelWidth; self.physicalPixelHeight=oldPixelHeight; }
+        return;
+    }
+    self.physicalPixelWidth=oldPixelWidth; self.physicalPixelHeight=oldPixelHeight;
+    if (!independentPhysical || (!publicPlan && (pixelWidth!=width*2 || pixelHeight!=height*2))) {
+        [self showError:error ?: @"当前显示布局无法应用所选格式，原设置未更改。"]; return;
+    }
+    error=nil;
+    NSDictionary *plan=[self hiddenNativePlanForDisplays:physical width:(unsigned int)width height:(unsigned int)height pixelWidth:(unsigned int)pixelWidth pixelHeight:(unsigned int)pixelHeight rate:rate error:&error];
+    if (!plan) { [self showError:error ?: @"系统未提供所选的精确格式，原设置未更改。"]; return; }
+    self.applyingDisplaySettings=YES;
+    NSUInteger generation=++self.displayChangeGeneration;
+    self.failedSettingsSignature=nil; self.displaySettingsIssue=nil;
+    BOOL kept=NO;
+    @try {
+        if ([self applyHiddenNativePlan:plan error:&error]) {
+            BOOL confirmed=[self confirmUnifiedDisplaySettings];
+            if (generation!=self.displayChangeGeneration) {
+                error=@"显示设置操作已更新，已停止旧操作。";
+            } else {
+                BOOL topology=[self topologyMatchesPhysical:physical virtualIDs:@[]];
+                if (confirmed && topology && [self hiddenNativePlanIsCurrent:plan error:&error]) {
+                    self.selectedProfile=kProfileCount; self.customLogicalWidth=(unsigned int)width; self.customLogicalHeight=(unsigned int)height;
+                    self.selectedRefreshRate=rate; self.physicalPixelWidth=(unsigned int)pixelWidth; self.physicalPixelHeight=(unsigned int)pixelHeight;
+                    self.unifiedSettingsEnabled=YES; self.suspendSavedSettings=NO;
+                    [self persistUnifiedSettings]; kept=YES; error=nil;
+                } else {
+                    NSString *restoreError=nil;
+                    BOOL restored=topology && [self restoreHiddenNativePlan:plan error:&restoreError];
+                    error=restored ? @"未保留新设置，已核对操作前配置。" : (restoreError ?: @"显示状态或连接已变化，未覆盖当前设置。请检查系统显示器设置。");
+                }
+            }
+        }
+    } @finally {
+        if (!kept && generation==self.displayChangeGeneration) self.suspendSavedSettings=YES;
+        self.lastSettingsApplyKept=kept; self.displaySettingsIssue=error;
+        self.applyingDisplaySettings=NO;
+        [self rebuildMenu];
+    }
+    if (error.length) [self showError:error];
+    [self scheduleDisplayReconciliation];
+}
+
+// Only expose rates matching the selected logical size AND 2x pixel size.
+- (NSArray<NSNumber *> *)hiDPIRatesForDisplay:(CGDirectDisplayID)display width:(unsigned int)width height:(unsigned int)height {
+    CFArrayRef modes = CGDisplayCopyAllDisplayModes(display, (__bridge CFDictionaryRef)@{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes:@YES});
+    NSMutableArray<NSNumber *> *rates = [NSMutableArray array];
+    if (modes) {
+        for (id value in (__bridge NSArray *)modes) {
+            CGDisplayModeRef mode = (__bridge CGDisplayModeRef)value;
+            double rate = CGDisplayModeGetRefreshRate(mode);
+            if (!CGDisplayModeIsUsableForDesktopGUI(mode) || !RDMatchesHiDPI(CGDisplayModeGetWidth(mode), CGDisplayModeGetHeight(mode), CGDisplayModeGetPixelWidth(mode), CGDisplayModeGetPixelHeight(mode), rate, width, height, rate)) continue;
+            BOOL duplicate = NO;
+            for (NSNumber *existing in rates) if (fabs(existing.doubleValue-rate) < 0.01) duplicate = YES;
+            if (!duplicate) [rates addObject:@(rate)];
+        }
+        CFRelease(modes);
+    }
+    return [rates sortedArrayUsingSelector:@selector(compare:)];
+}
+
+- (void)settingsResolutionChanged:(id)sender {
+    (void)sender;
+    NSInteger selection = self.settingsResolutionPopup.selectedItem.tag;
+    unsigned int width = selection >= 0 && (NSUInteger)selection < kProfileCount ? kProfiles[selection].logicalWidth : self.customLogicalWidth;
+    unsigned int height = selection >= 0 && (NSUInteger)selection < kProfileCount ? kProfiles[selection].logicalHeight : self.customLogicalHeight;
+    if (self.settingsCustomWidth) {
+        width = (unsigned int)MAX(0, self.settingsCustomWidth.integerValue);
+        height = (unsigned int)MAX(0, self.settingsCustomHeight.integerValue);
+    }
+    NSArray *physical = [self physicalDisplayIDs];
+    NSMutableArray<NSNumber *> *rates = [NSMutableArray arrayWithArray:@[@30,@60,@75,@90,@120,@144,@165]];
+    if (self.virtualMirrorEnabled && physical.count) {
+        NSIndexSet *unsupported=[rates indexesOfObjectsPassingTest:^BOOL(NSNumber *rate, NSUInteger idx, BOOL *stop) {
+            (void)idx; (void)stop;
+            return [self physicalMirrorModePlan:physical rate:rate.doubleValue error:NULL]==nil;
+        }];
+        [rates removeObjectsAtIndexes:unsupported];
+    } else if (physical.count) {
+        [rates setArray:[self hiDPIRatesForDisplay:[physical.firstObject unsignedIntValue] width:width height:height]];
+        for (NSNumber *display in physical) {
+            NSArray *available = [self hiDPIRatesForDisplay:display.unsignedIntValue width:width height:height];
+            NSIndexSet *unavailable = [rates indexesOfObjectsPassingTest:^BOOL(NSNumber *rate, NSUInteger idx, BOOL *stop) {
+                (void)idx; (void)stop;
+                for (NSNumber *candidate in available) if (fabs(candidate.doubleValue-rate.doubleValue)<0.6) return NO;
+                return YES;
+            }];
+            [rates removeObjectsAtIndexes:unavailable];
+        }
+    }
+    NSPopUpButton *popup = self.settingsRefreshPopup;
+    double preferred = popup.selectedItem ? [popup.selectedItem.representedObject doubleValue] : self.selectedRefreshRate;
+    [popup removeAllItems];
+    for (NSNumber *rate in rates) {
+        [popup addItemWithTitle:[NSString stringWithFormat:@"%g Hz", rate.doubleValue]];
+        popup.lastItem.representedObject = rate;
+    }
+    if (!rates.count) [popup addItemWithTitle:self.virtualMirrorEnabled ? @"无共同可用刷新率" : @"无匹配的 HiDPI 模式"];
+    popup.enabled = rates.count > 0;
+    for (NSMenuItem *item in popup.itemArray) if (fabs([item.representedObject doubleValue]-preferred)<0.6) { [popup selectItem:item]; break; }
+    self.settingsRefreshHint.stringValue = physical.count ? @"按实体屏共同可用刷新率列出" : @"无实体屏，使用虚拟屏刷新率";
+}
+
+- (void)controlTextDidChange:(NSNotification *)notification {
+    if (notification.object == self.settingsCustomWidth || notification.object == self.settingsCustomHeight) [self settingsResolutionChanged:nil];
+}
+
+- (void)showCustomResolutionAtRate:(double)rate {
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"自定义 HiDPI 分辨率";
     alert.informativeText = @"输入逻辑桌面的宽度和高度。实际渲染分辨率为输入值的 2 倍。";
     [alert addButtonWithTitle:@"应用"];
     [alert addButtonWithTitle:@"取消"];
 
-    NSView *accessory = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 300, 72)];
+    NSView *accessory = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 400, 114)];
     NSTextField *widthLabel = [NSTextField labelWithString:@"宽度"];
     widthLabel.frame = NSMakeRect(0, 42, 54, 24);
     NSTextField *widthField = [[NSTextField alloc] initWithFrame:NSMakeRect(58, 40, 100, 26)];
@@ -694,6 +1079,19 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
     NSTextField *preview = [NSTextField labelWithString:@"2× HiDPI 渲染"];
     preview.textColor = NSColor.secondaryLabelColor;
     preview.frame = NSMakeRect(174, 23, 126, 24);
+    for (NSView *view in @[widthLabel,widthField,heightLabel,heightField,preview]) {
+        NSRect frame = view.frame; frame.origin.y += 42; view.frame = frame;
+    }
+    NSPopUpButton *customRate = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(58, 4, 230, 30) pullsDown:NO];
+    [customRate addItemWithTitle:[NSString stringWithFormat:@"%g Hz", rate]];
+    customRate.lastItem.representedObject = @(rate);
+    self.settingsResolutionPopup = nil;
+    self.settingsRefreshPopup = customRate;
+    self.settingsCustomWidth = widthField;
+    self.settingsCustomHeight = heightField;
+    widthField.delegate = self; heightField.delegate = self;
+    [self settingsResolutionChanged:nil];
+    [accessory addSubview:customRate];
     [accessory addSubview:widthLabel];
     [accessory addSubview:widthField];
     [accessory addSubview:heightLabel];
@@ -714,37 +1112,665 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
         return;
     }
 
-    self.customLogicalWidth = (unsigned int)width;
-    self.customLogicalHeight = (unsigned int)height;
-    self.selectedProfile = kProfileCount;
-    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-    [defaults setObject:@"custom-hidpi" forKey:@"profile"];
-    [defaults setInteger:width forKey:@"customLogicalWidth"];
-    [defaults setInteger:height forKey:@"customLogicalHeight"];
-    [self restartDisplaysIfActive];
+    double selectedRate = [customRate.selectedItem.representedObject doubleValue];
+    if (selectedRate <= 0) {
+        NSString *reason = nil;
+        [self modePlanForDisplays:[self physicalDisplayIDs] width:(unsigned int)width height:(unsigned int)height rate:rate error:&reason];
+        NSAlert *error = [NSAlert new];
+        error.messageText = @"无法应用显示设置";
+        error.informativeText = reason ?: @"当前连接没有此尺寸的共同 2× HiDPI 模式。原设置未更改。";
+        [error runModal];
+        return;
+    }
+    [self applyVirtualProfile:kProfileCount width:(unsigned int)width height:(unsigned int)height rate:selectedRate];
 }
 
-- (NSUInteger)physicalDisplayCount {
+// The plan is built completely before a transaction is committed. Never choose
+// a nearby resolution/refresh rate and present it as the requested setting.
+- (NSDictionary<NSNumber *, id> *)modePlanForDisplays:(NSArray<NSNumber *> *)ids
+    width:(unsigned int)width height:(unsigned int)height rate:(double)rate error:(NSString **)error {
+    NSMutableDictionary *plan = [NSMutableDictionary dictionary];
+    for (NSNumber *key in ids) {
+        CGDirectDisplayID display = key.unsignedIntValue;
+        if (!CGDisplayIsOnline(display) || CGDisplayIsInMirrorSet(display)) {
+            if (error) *error = @"显示器已断开或处于镜像模式；请恢复扩展显示后重试。";
+            return nil;
+        }
+        CFArrayRef modes = CGDisplayCopyAllDisplayModes(display, (__bridge CFDictionaryRef)@{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes:@YES});
+        BOOL nativePhysical = self.physicalPixelWidth && self.physicalPixelHeight && RDIsPhysicalDisplay(CGDisplayVendorNumber(display),CGDisplayModelNumber(display));
+        if (modes) {
+            for (CFIndex i = 0; i < CFArrayGetCount(modes); i++) {
+                CGDisplayModeRef mode = (CGDisplayModeRef)CFArrayGetValueAtIndex(modes, i);
+                BOOL match = nativePhysical ?
+                    CGDisplayModeGetWidth(mode)==width && CGDisplayModeGetHeight(mode)==height &&
+                    CGDisplayModeGetPixelWidth(mode)==self.physicalPixelWidth && CGDisplayModeGetPixelHeight(mode)==self.physicalPixelHeight &&
+                    RDNativeRateMatches(CGDisplayModeGetRefreshRate(mode),rate) : RDMatchesHiDPI(
+                    CGDisplayModeGetWidth(mode), CGDisplayModeGetHeight(mode),
+                    CGDisplayModeGetPixelWidth(mode), CGDisplayModeGetPixelHeight(mode),
+                    CGDisplayModeGetRefreshRate(mode), width, height, rate);
+                if (CGDisplayModeIsUsableForDesktopGUI(mode) && match) {
+                    plan[key] = (__bridge id)mode;
+                    break;
+                }
+            }
+            CFRelease(modes);
+        }
+        if (!plan[key]) {
+            if (nativePhysical) {
+                if (error) *error=[NSString stringWithFormat:@"%@：当前连接没有桌面 %u × %u、渲染 %u × %u、%g Hz 的对应模式。可能屏幕连接或模式列表已变化，请重新打开显示设置。原设置未更改。",PhysicalDisplayName(display),width,height,self.physicalPixelWidth,self.physicalPixelHeight,rate];
+                return nil;
+            }
+            NSArray *available = [self hiDPIRatesForDisplay:display width:width height:height];
+            if (error) {
+                if (available.count) {
+                    NSMutableArray *labels = [NSMutableArray array];
+                    for (NSNumber *hz in available) [labels addObject:[NSString stringWithFormat:@"%g Hz", hz.doubleValue]];
+                    *error = [NSString stringWithFormat:@"%@：刷新率 %g Hz 无匹配模式。%u × %u 的 2× HiDPI 当前可用刷新率：%@。原设置未更改。", PhysicalDisplayName(display), rate, width, height, [labels componentsJoinedByString:@"、"]];
+                } else {
+                    BOOL logicalSizeAvailable = NO;
+                    CFArrayRef native = CGDisplayCopyAllDisplayModes(display, (__bridge CFDictionaryRef)@{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes:@YES});
+                    if (native) {
+                        for (id value in (__bridge NSArray *)native) {
+                            CGDisplayModeRef candidate = (__bridge CGDisplayModeRef)value;
+                            if (CGDisplayModeIsUsableForDesktopGUI(candidate) && CGDisplayModeGetWidth(candidate)==width && CGDisplayModeGetHeight(candidate)==height) logicalSizeAvailable = YES;
+                        }
+                        CFRelease(native);
+                    }
+                    *error = [NSString stringWithFormat:@"%@：%@。原设置未更改。", PhysicalDisplayName(display), logicalSizeAvailable ? [NSString stringWithFormat:@"%u × %u 尺寸有可用模式，但 macOS 当前未提供其 2× HiDPI 模式（渲染 %u × %u）", width, height, width*2, height*2] : [NSString stringWithFormat:@"macOS 当前未提供桌面尺寸 %u × %u 的模式", width, height]];
+                }
+            }
+            return nil;
+        }
+    }
+    return plan;
+}
+
+- (NSDictionary<NSNumber *, id> *)currentModesForDisplays:(NSArray<NSNumber *> *)ids {
+    NSMutableDictionary *modes = [NSMutableDictionary dictionary];
+    for (NSNumber *key in ids) {
+        CGDisplayModeRef mode = CGDisplayCopyDisplayMode(key.unsignedIntValue);
+        if (!mode) return nil;
+        modes[key] = CFBridgingRelease(mode);
+    }
+    return modes;
+}
+
+- (BOOL)configureModes:(NSDictionary<NSNumber *, id> *)modes {
+    if (!modes.count) return YES;
+    CGDisplayConfigRef config = NULL;
+    if (CGBeginDisplayConfiguration(&config) != kCGErrorSuccess) return NO;
+    for (NSNumber *key in modes) {
+        if (!CGDisplayIsOnline(key.unsignedIntValue)) { CGCancelDisplayConfiguration(config); return NO; }
+        if (CGConfigureDisplayWithDisplayMode(config, key.unsignedIntValue, (__bridge CGDisplayModeRef)modes[key], NULL) != kCGErrorSuccess) {
+            CGCancelDisplayConfiguration(config); return NO;
+        }
+    }
+    return CGCompleteDisplayConfiguration(config, kCGConfigureForSession) == kCGErrorSuccess;
+}
+
+- (BOOL)modesAreCurrent:(NSDictionary<NSNumber *, id> *)plan {
+    for (NSNumber *key in plan) {
+        if (!CGDisplayIsOnline(key.unsignedIntValue) || CGDisplayIsInMirrorSet(key.unsignedIntValue)) return NO;
+        CGDisplayModeRef wanted = (__bridge CGDisplayModeRef)plan[key];
+        CGDisplayModeRef actual = CGDisplayCopyDisplayMode(key.unsignedIntValue);
+        if (!actual) return NO;
+        BOOL equal = CGDisplayModeGetWidth(actual)==CGDisplayModeGetWidth(wanted) && CGDisplayModeGetHeight(actual)==CGDisplayModeGetHeight(wanted) &&
+            CGDisplayModeGetPixelWidth(actual)==CGDisplayModeGetPixelWidth(wanted) && CGDisplayModeGetPixelHeight(actual)==CGDisplayModeGetPixelHeight(wanted) &&
+            fabs(CGDisplayModeGetRefreshRate(actual)-CGDisplayModeGetRefreshRate(wanted))<0.6;
+        CFRelease(actual);
+        if (!equal) return NO;
+    }
+    return YES;
+}
+
+- (NSArray<NSNumber *> *)IDsForVirtualDisplays:(NSArray<CGVirtualDisplay *> *)displays {
+    NSMutableArray *ids = [NSMutableArray array];
+    for (CGVirtualDisplay *display in displays) [ids addObject:@(display.displayID)];
+    return ids;
+}
+
+- (NSArray *)virtualModesForProfile:(DisplayProfile)p rate:(double)rate {
+    NSMutableArray *rates=[NSMutableArray arrayWithObject:@(rate)];
+    NSArray *physical=[self physicalDisplayIDs];
+    for (NSNumber *candidate in @[@30,@60,@75,@90,@120,@144,@165]) {
+        if (fabs(candidate.doubleValue-rate)<0.6) continue;
+        if (physical.count && ![self physicalMirrorModePlan:physical rate:candidate.doubleValue error:NULL]) continue;
+        [rates addObject:candidate];
+    }
+    NSMutableArray *modes=[NSMutableArray array];
+    for (NSNumber *value in rates) {
+        id mode=[[NSClassFromString(@"CGVirtualDisplayMode") alloc] initWithWidth:p.logicalWidth height:p.logicalHeight refreshRate:value.doubleValue];
+        if (!mode) return nil;
+        [modes addObject:mode];
+    }
+    return modes;
+}
+
+- (BOOL)advertiseVirtualDisplays:(NSArray<CGVirtualDisplay *> *)displays profile:(DisplayProfile)p rate:(double)rate {
+    if (!displays.count) return YES;
+    // With hiDPI enabled this API accepts logical dimensions, not the
+    // doubled backing dimensions. Passing p.width doubles the desktop twice.
+    NSArray *modes=[self virtualModesForProfile:p rate:rate];
+    if (!modes.count) return NO;
+    CGVirtualDisplaySettings *settings = [[NSClassFromString(@"CGVirtualDisplaySettings") alloc] init];
+    settings.hiDPI = 1; settings.modes = modes;
+    BOOL accepted = YES;
+    for (CGVirtualDisplay *display in displays) if (![display applySettings:settings]) accepted = NO;
+    return accepted;
+}
+
+- (BOOL)topologyMatchesPhysical:(NSArray *)physical virtualIDs:(NSArray *)virtualIDs {
+    NSArray *current = [self physicalDisplayIDs];
+    return current && [[NSSet setWithArray:current] isEqualToSet:[NSSet setWithArray:physical]] &&
+        [[self IDsForVirtualDisplays:self.displays] isEqual:virtualIDs];
+}
+
+- (BOOL)restoreModes:(NSDictionary<NSNumber *, id> *)previous {
+    NSMutableDictionary *online = [NSMutableDictionary dictionary];
+    for (NSNumber *key in previous) if (CGDisplayIsOnline(key.unsignedIntValue)) online[key] = previous[key];
+    return [self configureModes:online];
+}
+
+- (BOOL)confirmUnifiedDisplaySettings {
+    NSAlert *alert = [[NSAlert alloc] init];
+    alert.messageText = @"保留这些显示设置？";
+    alert.informativeText = @"已应用所选桌面尺寸和刷新率。请在 15 秒内确认，超时自动恢复。";
+    if (self.virtualMirrorEnabled) {
+        alert.messageText=@"保留虚拟高清画面？";
+        alert.informativeText=@"实体屏正在显示虚拟屏提供的 HiDPI 画面。请在 15 秒内确认，超时自动恢复原画面。";
+    }
+    [alert addButtonWithTitle:@"保留设置"];
+    [alert addButtonWithTitle:@"恢复原设置"];
+    NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 15;
+    NSTimer *timer = [NSTimer timerWithTimeInterval:0.1 repeats:YES block:^(NSTimer *unused) {
+        (void)unused;
+        if (NSProcessInfo.processInfo.systemUptime >= deadline && NSApp.modalWindow == alert.window) [NSApp abortModal];
+    }];
+    [NSRunLoop.mainRunLoop addTimer:timer forMode:NSModalPanelRunLoopMode];
+    [NSApp activateIgnoringOtherApps:YES];
+    NSModalResponse response = [alert runModal];
+    [timer invalidate];
+    [alert.window orderOut:nil];
+    return response == NSAlertFirstButtonReturn;
+}
+
+- (void)persistUnifiedSettings {
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setObject:(self.selectedProfile < kProfileCount ? @(kProfiles[self.selectedProfile].key) : @"custom-hidpi") forKey:@"profile"];
+    [defaults setInteger:self.customLogicalWidth forKey:@"customLogicalWidth"];
+    [defaults setInteger:self.customLogicalHeight forKey:@"customLogicalHeight"];
+    [defaults setDouble:self.selectedRefreshRate forKey:@"refreshRate"];
+    [defaults setInteger:self.physicalPixelWidth forKey:@"physicalPixelWidth"];
+    [defaults setInteger:self.physicalPixelHeight forKey:@"physicalPixelHeight"];
+    [defaults setBool:YES forKey:@"unifiedDisplaySettingsEnabled"];
+    [defaults setBool:self.virtualMirrorEnabled forKey:@"virtualMirrorEnabled"];
+    [defaults setBool:self.mirrorConfigurationConfirmed forKey:@"mirrorConfigurationConfirmed"];
+}
+
+- (NSDictionary *)mirrorSnapshotForDisplays:(NSArray<NSNumber *> *)ids {
+    NSMutableDictionary *snapshot=[NSMutableDictionary dictionary];
+    for (NSNumber *key in ids) {
+        CGDirectDisplayID display=key.unsignedIntValue;
+        CGDisplayModeRef mode=CGDisplayCopyDisplayMode(display);
+        CFUUIDRef uuid=CGDisplayCreateUUIDFromDisplayID(display);
+        if (!mode || !uuid) { if (mode) CFRelease(mode); if (uuid) CFRelease(uuid); return nil; }
+        NSString *identity=CFBridgingRelease(CFUUIDCreateString(NULL,uuid)); CFRelease(uuid);
+        CGRect bounds=CGDisplayBounds(display);
+        snapshot[key]=@{@"mode":CFBridgingRelease(mode),@"mirror":@(CGDisplayMirrorsDisplay(display)),@"x":@(bounds.origin.x),@"y":@(bounds.origin.y),@"uuid":identity};
+    }
+    return snapshot;
+}
+
+- (NSDictionary *)mirrorRoutesForPhysical:(NSArray<NSNumber *> *)physical sources:(NSArray<NSNumber *> *)sources {
+    if (!sources.count) return nil;
+    NSMutableDictionary *routes=[NSMutableDictionary dictionary];
+    for (NSUInteger i=0;i<physical.count;i++) routes[physical[i]]=sources[i%sources.count];
+    return routes;
+}
+
+- (BOOL)mirrorRoutesAreCurrent:(NSDictionary<NSNumber *,NSNumber *> *)routes {
+    for (NSNumber *key in routes) if (!CGDisplayIsOnline(key.unsignedIntValue) || !CGDisplayIsOnline([routes[key] unsignedIntValue]) || CGDisplayMirrorsDisplay(key.unsignedIntValue)!=[routes[key] unsignedIntValue]) return NO;
+    return YES;
+}
+
+// The virtual source controls desktop geometry; a mirrored physical output
+// still has its own hardware timing. Prefer native, unscaled scan-out modes.
+- (NSDictionary *)physicalMirrorModePlan:(NSArray<NSNumber *> *)ids rate:(double)rate error:(NSString **)error {
+    NSMutableDictionary *plan=[NSMutableDictionary dictionary];
+    for (NSNumber *key in ids) {
+        CFArrayRef modes=CGDisplayCopyAllDisplayModes(key.unsignedIntValue,(__bridge CFDictionaryRef)@{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes:@YES});
+        id best=nil; BOOL bestNative=NO; size_t bestArea=0;
+        if (modes) {
+            for (id value in (__bridge NSArray *)modes) {
+                CGDisplayModeRef mode=(__bridge CGDisplayModeRef)value;
+                size_t w=CGDisplayModeGetWidth(mode),h=CGDisplayModeGetHeight(mode);
+                if (!CGDisplayModeIsUsableForDesktopGUI(mode) || !w || !h ||
+                    w!=CGDisplayModeGetPixelWidth(mode) || h!=CGDisplayModeGetPixelHeight(mode) ||
+                    fabs(CGDisplayModeGetRefreshRate(mode)-rate)>=0.6) continue;
+                BOOL native=(CGDisplayModeGetIOFlags(mode)&kDisplayModeNativeFlag)!=0;
+                if (!best || (native && !bestNative) || (native==bestNative && w*h>bestArea)) {
+                    best=value; bestNative=native; bestArea=w*h;
+                }
+            }
+            if (best) plan[key]=best;
+            CFRelease(modes);
+        }
+        if (!plan[key]) {
+            if (error) *error=[NSString stringWithFormat:@"%@：未提供 %g Hz 的实体输出模式。原设置未更改。",PhysicalDisplayName(key.unsignedIntValue),rate];
+            return nil;
+        }
+    }
+    return plan;
+}
+
+- (BOOL)physicalMirrorDisplays:(NSArray<NSNumber *> *)ids matchRate:(double)rate {
+    for (NSNumber *key in ids) {
+        CGDisplayModeRef mode=CGDisplayCopyDisplayMode(key.unsignedIntValue);
+        BOOL match=mode && fabs(CGDisplayModeGetRefreshRate(mode)-rate)<0.6;
+        if (mode) CFRelease(mode);
+        if (!match) return NO;
+    }
+    return YES;
+}
+
+// A physical mode from before mirroring is not valid in every mirror set.
+// Establish the route, then enumerate its derived modes instead of reusing a
+// native, unscaled mode with a different desktop geometry.
+- (BOOL)configureMirrorPlan:(NSDictionary *)virtualPlan physicalPlan:(NSDictionary *)physicalPlan routes:(NSDictionary *)routes sources:(NSArray *)sources {
+    if (![self modesAreCurrent:virtualPlan] && ![self configureModes:virtualPlan]) { self.displaySettingsIssue=@"虚拟源模式提交失败。"; return NO; }
+    if (![self mirrorRoutesAreCurrent:routes]) {
+        CGDisplayConfigRef routeConfig=NULL;
+        CGError status=CGBeginDisplayConfiguration(&routeConfig);
+        if (status!=kCGErrorSuccess) return NO;
+        for (NSNumber *key in routes) {
+            status=CGConfigureDisplayMirrorOfDisplay(routeConfig,key.unsignedIntValue,[routes[key] unsignedIntValue]);
+            if (status!=kCGErrorSuccess) { CGCancelDisplayConfiguration(routeConfig); self.displaySettingsIssue=[NSString stringWithFormat:@"建立镜像失败（%d）。",status]; return NO; }
+        }
+        int x=0;
+        for (NSNumber *key in sources) {
+            status=CGConfigureDisplayOrigin(routeConfig,key.unsignedIntValue,x,0);
+            if (status!=kCGErrorSuccess) { CGCancelDisplayConfiguration(routeConfig); return NO; }
+            x+=(int)CGDisplayModeGetWidth((__bridge CGDisplayModeRef)virtualPlan[key]);
+        }
+        status=CGCompleteDisplayConfiguration(routeConfig,kCGConfigureForSession);
+        if (status!=kCGErrorSuccess) { self.displaySettingsIssue=[NSString stringWithFormat:@"镜像提交失败（%d）。",status]; return NO; }
+    }
+    NSMutableDictionary *outputPlan=[NSMutableDictionary dictionary];
+    for (NSNumber *key in physicalPlan) {
+        CGDisplayModeRef actual=CGDisplayCopyDisplayMode(key.unsignedIntValue);
+        if (!actual) return NO;
+        double rate=CGDisplayModeGetRefreshRate((__bridge CGDisplayModeRef)physicalPlan[key]);
+        if (fabs(CGDisplayModeGetRefreshRate(actual)-rate)<0.6) { CFRelease(actual); continue; }
+        CFArrayRef modes=CGDisplayCopyAllDisplayModes(key.unsignedIntValue,(__bridge CFDictionaryRef)@{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes:@YES});
+        if (modes) {
+            for (id value in (__bridge NSArray *)modes) {
+                CGDisplayModeRef mode=(__bridge CGDisplayModeRef)value;
+                if (CGDisplayModeIsUsableForDesktopGUI(mode) &&
+                    CGDisplayModeGetWidth(mode)==CGDisplayModeGetWidth(actual) && CGDisplayModeGetHeight(mode)==CGDisplayModeGetHeight(actual) &&
+                    CGDisplayModeGetPixelWidth(mode)==CGDisplayModeGetPixelWidth(actual) && CGDisplayModeGetPixelHeight(mode)==CGDisplayModeGetPixelHeight(actual) &&
+                    fabs(CGDisplayModeGetRefreshRate(mode)-rate)<0.6) { outputPlan[key]=value; break; }
+            }
+            CFRelease(modes);
+        }
+        CFRelease(actual);
+        if (!outputPlan[key]) { self.displaySettingsIssue=[NSString stringWithFormat:@"%@：镜像后未提供 %g Hz 的匹配输出模式。",PhysicalDisplayName(key.unsignedIntValue),rate]; return NO; }
+    }
+    if (!outputPlan.count) return YES;
+    CGDisplayConfigRef config=NULL;
+    if (CGBeginDisplayConfiguration(&config)!=kCGErrorSuccess) return NO;
+    NSMutableDictionary *modes=[outputPlan mutableCopy]; [modes addEntriesFromDictionary:virtualPlan];
+    for (NSNumber *key in modes) {
+        CGError status=CGConfigureDisplayWithDisplayMode(config,key.unsignedIntValue,(__bridge CGDisplayModeRef)modes[key],NULL);
+        if (status!=kCGErrorSuccess) { CGCancelDisplayConfiguration(config); self.displaySettingsIssue=[NSString stringWithFormat:@"%@：刷新率配置失败（%d）。",PhysicalDisplayName(key.unsignedIntValue),status]; return NO; }
+    }
+    CGError status=CGCompleteDisplayConfiguration(config,kCGConfigureForSession);
+    if (status!=kCGErrorSuccess) self.displaySettingsIssue=[NSString stringWithFormat:@"刷新率同步提交失败（%d）。",status];
+    return status==kCGErrorSuccess;
+}
+
+- (BOOL)restoreMirrorSnapshot:(NSDictionary<NSNumber *,NSDictionary *> *)snapshot {
+    CGDisplayConfigRef config=NULL;
+    if (CGBeginDisplayConfiguration(&config)!=kCGErrorSuccess) return NO;
+    for (NSNumber *key in snapshot) {
+        CGDirectDisplayID display=key.unsignedIntValue;
+        if (!CGDisplayIsOnline(display)) continue;
+        CFUUIDRef uuid=CGDisplayCreateUUIDFromDisplayID(display);
+        NSString *identity=uuid ? CFBridgingRelease(CFUUIDCreateString(NULL,uuid)) : nil;
+        if (uuid) CFRelease(uuid);
+        NSDictionary *previous=snapshot[key];
+        if (![identity isEqual:previous[@"uuid"]]) continue; // Do not touch a replacement display reusing an ID.
+        CGDirectDisplayID original=[previous[@"mirror"] unsignedIntValue];
+        if (!CGDisplayIsOnline(original)) original=kCGNullDirectDisplay;
+        if (CGConfigureDisplayWithDisplayMode(config,display,(__bridge CGDisplayModeRef)previous[@"mode"],NULL)!=kCGErrorSuccess ||
+            CGConfigureDisplayMirrorOfDisplay(config,display,original)!=kCGErrorSuccess ||
+            (!original && CGConfigureDisplayOrigin(config,display,[previous[@"x"] intValue],[previous[@"y"] intValue])!=kCGErrorSuccess)) {
+            CGCancelDisplayConfiguration(config); return NO;
+        }
+    }
+    if (CGCompleteDisplayConfiguration(config,kCGConfigureForSession)!=kCGErrorSuccess) return NO;
+    for (NSNumber *key in snapshot) {
+        CGDirectDisplayID display=key.unsignedIntValue;
+        if (!CGDisplayIsOnline(display)) continue;
+        CFUUIDRef uuid=CGDisplayCreateUUIDFromDisplayID(display);
+        NSString *identity=uuid ? CFBridgingRelease(CFUUIDCreateString(NULL,uuid)) : nil;
+        if (uuid) CFRelease(uuid);
+        NSDictionary *previous=snapshot[key];
+        if (![identity isEqual:previous[@"uuid"]]) continue;
+        CGDirectDisplayID original=[previous[@"mirror"] unsignedIntValue];
+        if (!CGDisplayIsOnline(original)) original=kCGNullDirectDisplay;
+        if (CGDisplayMirrorsDisplay(display)!=original) return NO;
+        if (original) {
+            CGDisplayModeRef actual=CGDisplayCopyDisplayMode(display);
+            BOOL same=actual && fabs(CGDisplayModeGetRefreshRate(actual)-CGDisplayModeGetRefreshRate((__bridge CGDisplayModeRef)previous[@"mode"]))<0.6;
+            if (actual) CFRelease(actual);
+            if (!same) return NO;
+        }
+        if (!original) {
+            CGDisplayModeRef wanted=(__bridge CGDisplayModeRef)previous[@"mode"],actual=CGDisplayCopyDisplayMode(display);
+            BOOL same=actual && CGDisplayModeGetWidth(actual)==CGDisplayModeGetWidth(wanted) && CGDisplayModeGetHeight(actual)==CGDisplayModeGetHeight(wanted) && CGDisplayModeGetPixelWidth(actual)==CGDisplayModeGetPixelWidth(wanted) && CGDisplayModeGetPixelHeight(actual)==CGDisplayModeGetPixelHeight(wanted) && fabs(CGDisplayModeGetRefreshRate(actual)-CGDisplayModeGetRefreshRate(wanted))<0.6;
+            if (actual) CFRelease(actual);
+            if (!same) return NO;
+        }
+    }
+    return YES;
+}
+
+- (BOOL)restoreVirtualMirrorTargets {
+    if (!self.mirrorOriginals.count) return YES;
+    if (![self restoreMirrorSnapshot:self.mirrorOriginals]) return NO;
+    [self.mirrorOriginals removeAllObjects];
+    return YES;
+}
+
+- (NSDictionary *)virtualModePlan:(NSArray<NSNumber *> *)ids profile:(DisplayProfile)p rate:(double)rate {
+    NSMutableDictionary *plan=[NSMutableDictionary dictionary];
+    for (NSNumber *key in ids) {
+        CFArrayRef modes=CGDisplayCopyAllDisplayModes(key.unsignedIntValue,(__bridge CFDictionaryRef)@{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes:@YES});
+        if (modes) {
+            for (id value in (__bridge NSArray *)modes) {
+                CGDisplayModeRef mode=(__bridge CGDisplayModeRef)value;
+                if (CGDisplayModeIsUsableForDesktopGUI(mode) && RDMatchesHiDPI(CGDisplayModeGetWidth(mode),CGDisplayModeGetHeight(mode),CGDisplayModeGetPixelWidth(mode),CGDisplayModeGetPixelHeight(mode),CGDisplayModeGetRefreshRate(mode),p.logicalWidth,p.logicalHeight,rate)) { plan[key]=value; break; }
+            }
+            CFRelease(modes);
+        }
+        if (!plan[key]) return nil;
+    }
+    return plan;
+}
+
+- (BOOL)virtualSources:(NSArray<NSNumber *> *)ids matchProfile:(DisplayProfile)p rate:(double)rate {
+    if (!ids.count) return NO;
+    for (NSNumber *key in ids) {
+        CGDisplayModeRef mode=CGDisplayCopyDisplayMode(key.unsignedIntValue);
+        BOOL match=mode && !CGDisplayMirrorsDisplay(key.unsignedIntValue) && RDMatchesHiDPI(CGDisplayModeGetWidth(mode),CGDisplayModeGetHeight(mode),CGDisplayModeGetPixelWidth(mode),CGDisplayModeGetPixelHeight(mode),CGDisplayModeGetRefreshRate(mode),p.logicalWidth,p.logicalHeight,rate);
+        if (mode) CFRelease(mode);
+        if (!match) return NO;
+    }
+    return YES;
+}
+
+- (void)applyVirtualMirrorProfile:(NSUInteger)profile width:(unsigned int)width height:(unsigned int)height rate:(double)rate confirm:(BOOL)confirm {
+    self.lastSettingsApplyKept=NO;
+    if (self.applyingDisplaySettings || !self.displayManagementEnabled) return;
+    if (profile>kProfileCount || (profile==kProfileCount && (width<640 || height<480 || width>5120 || height>4320)) || !isfinite(rate) || rate<=0 || rate>240) { [self showError:@"虚拟屏设置超出支持范围。"]; return; }
+    NSArray *physical=[self physicalDisplayIDs];
+    if (!physical) { [self showError:@"无法读取当前显示器；未更改设置。"]; return; }
+    NSString *preflightError=nil;
+    NSDictionary *physicalPlan=[self physicalMirrorModePlan:physical rate:rate error:&preflightError];
+    if (!physicalPlan) { self.suspendSavedSettings=YES; [self showError:preflightError]; return; }
+    if (self.displays.count && self.displays.count!=self.selectedDisplayCount) { [self showError:@"虚拟屏数量正在变化，请暂停后重新启用。"]; return; }
+    NSDictionary *beforeTargets=[self mirrorSnapshotForDisplays:physical];
+    NSArray *oldSources=[self IDsForVirtualDisplays:self.displays];
+    NSDictionary *beforeSources=[self currentModesForDisplays:oldSources];
+    if (!beforeTargets || !beforeSources) { [self showError:@"无法保存当前显示状态；未更改设置。"]; return; }
+    NSArray *previousVirtuals=self.displays ?: @[];
+    NSDictionary *previousOriginals=[self.mirrorOriginals copy] ?: @{};
+    DisplayProfile previousProfile=[self currentProfile];
+    NSUInteger previousSelection=self.selectedProfile;
+    unsigned int previousWidth=self.customLogicalWidth,previousHeight=self.customLogicalHeight;
+    double previousRate=self.selectedRefreshRate;
+    DisplayProfile requested=profile<kProfileCount ? kProfiles[profile] : (DisplayProfile){"custom-hidpi","Custom HiDPI",width*2,height*2,width,height,YES};
+    self.applyingDisplaySettings=YES; ++self.displayChangeGeneration;
+    self.displaySettingsIssue=nil;
+    self.selectedProfile=profile; self.customLogicalWidth=width; self.customLogicalHeight=height; self.selectedRefreshRate=rate;
+    BOOL kept=NO,restored=YES;
+    NSString *error=nil;
+    @try {
+        self.mirrorOriginals=[previousOriginals mutableCopy];
+        for (NSNumber *key in beforeTargets) if (![self.mirrorOriginals[key][@"uuid"] isEqual:beforeTargets[key][@"uuid"]]) self.mirrorOriginals[key]=beforeTargets[key];
+        BOOL advertised;
+        if (!previousVirtuals.count) { self.displays=[self createVirtualDisplays:self.selectedDisplayCount]; advertised=self.displays.count==self.selectedDisplayCount; }
+        else advertised=[self virtualModePlan:oldSources profile:requested rate:rate]!=nil || [self advertiseVirtualDisplays:self.displays profile:requested rate:rate];
+        NSArray *sources=[self IDsForVirtualDisplays:self.displays];
+        NSDictionary *plan=nil;
+        for (NSUInteger attempt=0;advertised && attempt<10 && !plan;attempt++) {
+            plan=[self virtualModePlan:sources profile:requested rate:rate];
+            if (!plan) [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+        }
+        NSDictionary *routes=[self mirrorRoutesForPhysical:physical sources:sources];
+        if (!advertised) error=self.displaySettingsIssue ?: @"虚拟屏未接受模式定义，正在恢复原画面。";
+        else if (!plan || !routes) {
+            NSMutableArray *available=[NSMutableArray array];
+            for (NSNumber *source in sources) {
+                CFArrayRef modes=CGDisplayCopyAllDisplayModes(source.unsignedIntValue,(__bridge CFDictionaryRef)@{(__bridge NSString *)kCGDisplayShowDuplicateLowResolutionModes:@YES});
+                if (modes) {
+                    for (id value in (__bridge NSArray *)modes) {
+                        CGDisplayModeRef mode=(__bridge CGDisplayModeRef)value;
+                        if (CGDisplayModeIsUsableForDesktopGUI(mode)) [available addObject:[NSString stringWithFormat:@"%zu×%zu（渲染 %zu×%zu），%g Hz",CGDisplayModeGetWidth(mode),CGDisplayModeGetHeight(mode),CGDisplayModeGetPixelWidth(mode),CGDisplayModeGetPixelHeight(mode),CGDisplayModeGetRefreshRate(mode)]];
+                    }
+                    CFRelease(modes);
+                }
+            }
+            error=[NSString stringWithFormat:@"虚拟屏未提供请求的 %u×%u HiDPI、%g Hz。系统当前返回：%@。已恢复原画面。",requested.logicalWidth,requested.logicalHeight,rate,available.count ? [available componentsJoinedByString:@"；"] : @"尚无可用模式"];
+        }
+        else if (!([self virtualSources:sources matchProfile:requested rate:rate] && [self mirrorRoutesAreCurrent:routes] && [self physicalMirrorDisplays:physical matchRate:rate]) &&
+                 ![self configureMirrorPlan:plan physicalPlan:physicalPlan routes:routes sources:sources]) error=self.displaySettingsIssue ?: @"macOS 拒绝实体刷新率或虚拟镜像设置，正在恢复原画面。";
+        else if (![self virtualSources:sources matchProfile:requested rate:rate] || ![self mirrorRoutesAreCurrent:routes] || ![self physicalMirrorDisplays:physical matchRate:rate]) error=@"实体屏与虚拟屏的实际刷新率或镜像方向不匹配，正在恢复原画面。";
+        else if ((!confirm || [self confirmUnifiedDisplaySettings]) && [self topologyMatchesPhysical:physical virtualIDs:sources] && [self virtualSources:sources matchProfile:requested rate:rate] && [self mirrorRoutesAreCurrent:routes] && [self physicalMirrorDisplays:physical matchRate:rate]) {
+            self.unifiedSettingsEnabled=YES; self.suspendSavedSettings=NO; self.mirrorConfigurationConfirmed=YES;
+            [self persistUnifiedSettings]; kept=YES;
+        } else error=@"未确认或屏幕连接发生变化，已恢复原画面。";
+        if (!kept) {
+            BOOL advertRestored=!previousVirtuals.count || [self virtualModePlan:oldSources profile:previousProfile rate:previousRate]!=nil || [self advertiseVirtualDisplays:previousVirtuals profile:previousProfile rate:previousRate];
+            BOOL sourcesRestored=[self restoreModes:beforeSources];
+            BOOL targetsRestored=[self restoreMirrorSnapshot:beforeTargets];
+            restored=advertRestored && sourcesRestored && targetsRestored;
+            if (!restored) error=@"恢复原画面未全部成功，已保留虚拟屏避免丢失画面；请勿退出软件。";
+        }
+    } @finally {
+        if (!kept) {
+            self.selectedProfile=previousSelection; self.customLogicalWidth=previousWidth; self.customLogicalHeight=previousHeight; self.selectedRefreshRate=previousRate;
+            if (restored) { self.displays=[previousVirtuals mutableCopy]; self.mirrorOriginals=[previousOriginals mutableCopy]; }
+            self.suspendSavedSettings=YES;
+        }
+        self.applyingDisplaySettings=NO; self.lastSettingsApplyKept=kept; self.displaySettingsIssue=error;
+        [self rebuildMenu];
+    }
+    if (error) [self showError:error];
+    if (kept) [self scheduleDisplayReconciliation];
+}
+
+- (void)applyUnifiedSettingsProfile:(NSUInteger)profile width:(unsigned int)width height:(unsigned int)height rate:(double)rate {
+    if (self.virtualMirrorEnabled) { [self applyVirtualMirrorProfile:profile width:width height:height rate:rate confirm:YES]; return; }
+    self.lastSettingsApplyKept = NO;
+    if (self.applyingDisplaySettings) return;
+    if (!self.displayManagementEnabled) { [self showError:@"请先启用屏幕管理，再应用统一设置。"]; return; }
+    if (profile > kProfileCount || (profile == kProfileCount && (width < 640 || width > 5120 || height < 480 || height > 4320)) || !isfinite(rate) || rate <= 0 || rate > 1000) {
+        [self showError:@"显示设置超出支持范围。"]; return;
+    }
+    NSArray *physical = [self physicalDisplayIDs];
+    if (!physical || self.mirroredPhysicalDisplay) { [self showError:@"无法读取显示器，或旧镜像尚未恢复。请先恢复原镜像后重试。"]; return; }
+    NSUInteger desired = self.preferPhysicalDisplays ? (physical.count >= self.selectedDisplayCount ? 0 : self.selectedDisplayCount - physical.count) : self.selectedDisplayCount;
+    if (self.displays.count != desired && self.displays.count != 0) { [self showError:@"屏幕连接正在变化，请等待屏幕数量稳定后重试。"]; return; }
+    DisplayProfile requested = profile < kProfileCount ? kProfiles[profile] : (DisplayProfile){"custom-hidpi", "Custom HiDPI", width*2, height*2, width, height, YES};
+    NSString *error = nil;
+    NSDictionary *physicalPlan = [self modePlanForDisplays:physical width:requested.logicalWidth height:requested.logicalHeight rate:rate error:&error];
+    if (!physicalPlan) { [self showError:error]; return; }
+    NSArray *virtualIDs = [self IDsForVirtualDisplays:self.displays];
+    NSDictionary *previousModes = [self currentModesForDisplays:[physical arrayByAddingObjectsFromArray:virtualIDs]];
+    if (!previousModes) { [self showError:@"无法保存当前显示模式，未更改设置。"]; return; }
+    NSUInteger previousProfile = self.selectedProfile;
+    unsigned int previousWidth = self.customLogicalWidth, previousHeight = self.customLogicalHeight;
+    double previousRate = self.selectedRefreshRate;
+    DisplayProfile previousDisplayProfile = [self currentProfile];
+    // Existing screen objects and IDs must survive both success and rollback.
+    NSArray *previousVirtuals = self.displays;
+    BOOL kept = NO;
+    self.applyingDisplaySettings = YES;
+    ++self.displayChangeGeneration;
+    self.displaySettingsIssue = nil;
+    self.failedSettingsSignature = nil;
+    self.selectedProfile = profile; self.customLogicalWidth = width; self.customLogicalHeight = height; self.selectedRefreshRate = rate;
+    @try {
+        BOOL advertised;
+        if (!previousVirtuals.count && desired) {
+            self.displays = [self createVirtualDisplays:desired];
+            advertised = self.displays.count == desired;
+            virtualIDs = [self IDsForVirtualDisplays:self.displays];
+        } else advertised = [self advertiseVirtualDisplays:previousVirtuals profile:requested rate:rate];
+        if (!advertised) { error = @"虚拟屏未接受该模式，已保留原显示器和原设置。"; }
+        else {
+            NSDictionary *virtualPlan = nil;
+            for (NSUInteger attempt = 0; attempt < 10 && !virtualPlan; attempt++) {
+                virtualPlan = [self modePlanForDisplays:virtualIDs width:requested.logicalWidth height:requested.logicalHeight rate:rate error:&error];
+                if (!virtualPlan) [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+            }
+            if (virtualPlan) {
+                NSMutableDictionary *plan = [physicalPlan mutableCopy]; [plan addEntriesFromDictionary:virtualPlan];
+                if (![self configureModes:plan]) {
+                    error = @"macOS 拒绝应用统一显示模式，原设置未保存。";
+                }
+                else {
+                    if ([self modesAreCurrent:plan] && [self confirmUnifiedDisplaySettings] && [self topologyMatchesPhysical:physical virtualIDs:virtualIDs] && [self modesAreCurrent:plan]) {
+                        self.unifiedSettingsEnabled = YES; self.suspendSavedSettings = NO;
+                        [self persistUnifiedSettings]; kept = YES; error = nil;
+                    } else error = @"未确认或实际显示模式不匹配，已恢复原设置。";
+                }
+            }
+        }
+        if (!kept) {
+            BOOL restoredAdvertisement = [self advertiseVirtualDisplays:previousVirtuals profile:previousDisplayProfile rate:previousRate];
+            BOOL restoredModes = [self restoreModes:previousModes];
+            if (!restoredAdvertisement || !restoredModes) error = @"恢复原显示模式失败，请打开系统显示器设置检查。";
+        }
+    } @finally {
+        if (!kept) {
+            self.selectedProfile = previousProfile; self.customLogicalWidth = previousWidth;
+            self.customLogicalHeight = previousHeight; self.selectedRefreshRate = previousRate;
+            self.displays = [previousVirtuals mutableCopy];
+            self.suspendSavedSettings = YES; // Queued display callbacks must not undo a cancellation.
+        }
+        self.applyingDisplaySettings = NO;
+        self.lastSettingsApplyKept = kept;
+        self.displaySettingsIssue = error;
+        [self rebuildMenu];
+    }
+    if (error) [self showError:error];
+    // A cable may have been unplugged during the modal confirmation. Reconcile
+    // screen COUNT even after rollback, but suspend reapplying saved modes.
+    [self scheduleDisplayReconciliation];
+}
+
+- (NSString *)settingsSignatureForDisplays:(NSArray<NSNumber *> *)ids profile:(DisplayProfile)p {
+    NSMutableString *signature = [NSMutableString stringWithFormat:@"%u/%u/%u/%u/%.2f", p.logicalWidth, p.logicalHeight,self.physicalPixelWidth,self.physicalPixelHeight, self.selectedRefreshRate];
+    for (NSNumber *key in ids) {
+        CGDirectDisplayID display = key.unsignedIntValue;
+        CGDisplayModeRef mode = CGDisplayCopyDisplayMode(display);
+        [signature appendFormat:@"/%u:%u:%zu:%zu:%zu:%zu:%.2f", display, CGDisplayMirrorsDisplay(display),
+            mode ? CGDisplayModeGetWidth(mode) : 0, mode ? CGDisplayModeGetHeight(mode) : 0,
+            mode ? CGDisplayModeGetPixelWidth(mode) : 0, mode ? CGDisplayModeGetPixelHeight(mode) : 0,
+            mode ? CGDisplayModeGetRefreshRate(mode) : 0];
+        if (mode) CFRelease(mode);
+    }
+    return signature;
+}
+
+- (void)applySavedSettingsToActiveDisplays {
+    if (self.virtualMirrorEnabled) return; // Mirror sources, not physical native modes, own the desktop.
+    if (!self.unifiedSettingsEnabled || self.applyingDisplaySettings || self.suspendSavedSettings) return;
+    NSArray *physical = [self physicalDisplayIDs];
+    if (!physical) return;
+    NSArray *ids = [physical arrayByAddingObjectsFromArray:[self IDsForVirtualDisplays:self.displays]];
+    DisplayProfile p = [self currentProfile];
+    NSString *signature = [self settingsSignatureForDisplays:ids profile:p];
+    if ([signature isEqualToString:self.failedSettingsSignature]) return;
+    NSString *error = nil;
+    NSDictionary *plan = [self modePlanForDisplays:ids width:p.logicalWidth height:p.logicalHeight rate:self.selectedRefreshRate error:&error];
+    BOOL pureNative = physical.count && !self.displays.count && ids.count == physical.count;
+    if (!pureNative && plan && [self modesAreCurrent:plan]) { self.displaySettingsIssue = nil; return; }
+    NSDictionary *previous = !pureNative && plan ? [self currentModesForDisplays:ids] : nil;
+    BOOL ok = NO;
+    self.applyingDisplaySettings = YES;
+    if (pureNative) {
+        // Public and hidden native modes share independent baseline/verification.
+        // Mixed targets and virtual mirror sources retain their existing path.
+        NSString *hiddenError = nil;
+        ok = [self restoreHiddenNativeModesForDisplays:physical width:p.logicalWidth height:p.logicalHeight
+            pixelWidth:(self.physicalPixelWidth ?: p.width) pixelHeight:(self.physicalPixelHeight ?: p.height)
+            rate:self.selectedRefreshRate error:&hiddenError];
+        if (!ok && hiddenError.length) error = error.length ? [NSString stringWithFormat:@"%@ %@",error,hiddenError] : hiddenError;
+    } else if (plan && previous) {
+        ok = [self configureModes:plan] && [self modesAreCurrent:plan];
+        if (!ok && ![self restoreModes:previous]) error = @"恢复原显示模式失败，请检查系统显示器设置。";
+    }
+    self.applyingDisplaySettings = NO;
+    self.failedSettingsSignature = ok ? nil : signature;
+    self.displaySettingsIssue = ok ? nil : (error ?: @"系统未接受已保存的统一模式，保留当前屏幕，不自动镜像或降档。");
+}
+
+- (BOOL)restoreHiddenNativeModesForDisplays:(NSArray<NSNumber *> *)ids
+    width:(unsigned int)width height:(unsigned int)height
+    pixelWidth:(unsigned int)pixelWidth pixelHeight:(unsigned int)pixelHeight
+    rate:(double)rate error:(NSString **)error {
+    return RDApplyHiddenNativeModes(ids,width,height,pixelWidth,pixelHeight,rate,error);
+}
+
+- (NSArray<NSNumber *> *)physicalDisplayIDs {
     CGDirectDisplayID ids[64]; uint32_t count = 0;
-    if (CGGetOnlineDisplayList(64, ids, &count) != kCGErrorSuccess) return NSNotFound;
-    NSUInteger physical = 0;
+    if (CGGetOnlineDisplayList(64, ids, &count) != kCGErrorSuccess) return nil;
+    NSMutableArray *physical = [NSMutableArray array];
     for (uint32_t i = 0; i < count; i++) {
-        if (CGDisplayVendorNumber(ids[i]) != 0xB33F) physical++;
+        if (RDIsPhysicalDisplay(CGDisplayVendorNumber(ids[i]), CGDisplayModelNumber(ids[i]))) [physical addObject:@(ids[i])];
     }
     return physical;
 }
 
+- (NSUInteger)physicalDisplayCount {
+    NSArray *physical = [self physicalDisplayIDs];
+    return physical ? physical.count : NSNotFound;
+}
+
 - (void)displayWake:(NSNotification *)notification {
     (void)notification;
+    self.failedSettingsSignature = nil;
+    self.failedVirtualCreationSignature = nil;
     [self scheduleDisplayReconciliation];
 }
 
 - (void)scheduleDisplayReconciliation {
+    if (!self.displayManagementEnabled) { self.displayReconciliationPending = NO; return; }
+    if (self.applyingDisplaySettings || self.reconcilingDisplays) {
+        // Merge callbacks received during a transaction. Drain once both busy
+        // states clear; never start a periodic retry or re-enter configuration.
+        self.displayReconciliationPending = YES;
+        return;
+    }
+    self.displayReconciliationPending = NO;
     NSUInteger generation = ++self.displayChangeGeneration;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (generation != self.displayChangeGeneration || !self.displayManagementEnabled || !self.preferPhysicalDisplays) return;
-        [self startDisplay:nil];
+    [self enqueueDisplayReconciliationAfter:0.6 generation:generation];
+}
+
+- (void)enqueueDisplayReconciliationAfter:(NSTimeInterval)delay generation:(NSUInteger)generation {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self performDisplayReconciliationForGeneration:generation];
     });
+}
+
+- (void)performDisplayReconciliationForGeneration:(NSUInteger)generation {
+    if (generation != self.displayChangeGeneration) return;
+    if (!self.displayManagementEnabled) { self.displayReconciliationPending = NO; return; }
+    if (self.applyingDisplaySettings || self.reconcilingDisplays) { self.displayReconciliationPending = YES; return; }
+    [self startDisplay:nil]; // Existing suspend, mirror, and saved-mode guards still apply.
 }
 
 - (void)togglePhysicalPriority:(id)sender {
@@ -762,8 +1788,10 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
 }
 
 - (void)restartDisplaysIfActive {
+    self.failedVirtualCreationSignature = nil;
+    self.failedSettingsSignature = nil;
     [self restorePhysicalDisplay:nil];
-    if (self.mirroredPhysicalDisplay) return;
+    if (self.mirroredPhysicalDisplay || self.mirrorOriginals.count) return;
     BOOL wasActive = self.displayManagementEnabled;
     self.displays = nil;
     [self rebuildMenu];
@@ -786,31 +1814,60 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
 - (void)showError:(NSString *)message {
     NSAlert *alert = [[NSAlert alloc] init];
     alert.alertStyle = NSAlertStyleCritical;
-    alert.messageText = @"无法创建虚拟显示器";
+    if (self.applyingDisplaySettings) { self.displaySettingsIssue = message; return; }
+    alert.messageText = @"无法应用显示设置";
     alert.informativeText = message ?: @"未知错误";
     [alert runModal];
 }
 
 - (void)startDisplay:(id)sender {
-    if (sender) self.displayManagementEnabled = YES;
+    if (self.applyingDisplaySettings || self.reconcilingDisplays) return;
+    if (sender) { self.displayManagementEnabled = YES; self.failedVirtualCreationSignature = nil; self.failedSettingsSignature = nil; }
     if (!self.displayManagementEnabled) return;
+    if (self.virtualMirrorEnabled) {
+        if (sender) self.suspendSavedSettings=NO;
+        if (self.suspendSavedSettings) { [self rebuildMenu]; return; }
+        NSArray *physicalIDs=[self physicalDisplayIDs];
+        if (!physicalIDs) return;
+        NSArray *sources=[self IDsForVirtualDisplays:self.displays];
+        NSDictionary *routes=[self mirrorRoutesForPhysical:physicalIDs sources:sources];
+        DisplayProfile requested=[self currentProfile];
+        if (sources.count==self.selectedDisplayCount && [self virtualSources:sources matchProfile:requested rate:self.selectedRefreshRate] && [self mirrorRoutesAreCurrent:routes] && [self physicalMirrorDisplays:physicalIDs matchRate:self.selectedRefreshRate]) { [self rebuildMenu]; return; }
+        if (!sender && sources.count==self.selectedDisplayCount && [self mirrorRoutesAreCurrent:routes]) {
+            // An external settings change must not trigger a mode fight with
+            // System Settings. Only an explicit Apply resumes enforcement.
+            self.suspendSavedSettings=YES;
+            self.displaySettingsIssue=@"检测到显示模式已在系统中更改，已暂停自动覆盖；需要同步时请在统一显示设置中应用。";
+            [self rebuildMenu]; return;
+        }
+        [self applyVirtualMirrorProfile:self.selectedProfile width:self.customLogicalWidth height:self.customLogicalHeight rate:self.selectedRefreshRate confirm:!self.mirrorConfigurationConfirmed];
+        return;
+    }
     NSUInteger physical = [self physicalDisplayCount];
     if (physical == NSNotFound) return; // Preserve the current topology if enumeration fails.
     NSUInteger desired = self.preferPhysicalDisplays
         ? (physical >= self.selectedDisplayCount ? 0 : self.selectedDisplayCount - physical)
         : self.selectedDisplayCount;
-    if (self.displays.count == desired) { [self rebuildMenu]; return; }
+    DisplayProfile p = [self currentProfile];
+    NSString *creationSignature = [NSString stringWithFormat:@"%lu/%lu/%u/%u/%.2f", (unsigned long)physical, (unsigned long)desired, p.width, p.height, self.selectedRefreshRate];
+    if ([creationSignature isEqualToString:self.failedVirtualCreationSignature]) { [self rebuildMenu]; return; }
+    if (self.displays.count == desired) { [self applySavedSettingsToActiveDisplays]; [self rebuildMenu]; return; }
     [self restorePhysicalDisplay:nil];
     if (self.mirroredPhysicalDisplay) return;
     self.displays = nil;
     if (desired == 0) {
         self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"display" accessibilityDescription:@"正在使用实体屏幕"];
-        [self rebuildMenu];
+        [self applySavedSettingsToActiveDisplays]; [self rebuildMenu];
         return;
     }
-    self.displays = [self createVirtualDisplays:desired];
+    self.reconcilingDisplays = YES;
+    @try {
+        self.displays = [self createVirtualDisplays:desired];
+        self.failedVirtualCreationSignature = self.displays ? nil : creationSignature;
+    } @finally { self.reconcilingDisplays = NO; }
     self.statusItem.button.image = [NSImage imageWithSystemSymbolName:(self.displays.count ? @"display.2" : @"display") accessibilityDescription:@"Retina Dummy"];
-    [self rebuildMenu];
+    [self applySavedSettingsToActiveDisplays]; [self rebuildMenu];
+    [self scheduleDisplayReconciliation];
 }
 
 - (NSMutableArray<CGVirtualDisplay *> *)createVirtualDisplays:(NSUInteger)desired {
@@ -822,15 +1879,16 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
 
     DisplayProfile p = [self currentProfile];
     NSMutableArray<CGVirtualDisplay *> *created = [NSMutableArray array];
-    Class modeClass = NSClassFromString(@"CGVirtualDisplayMode");
 
     for (NSUInteger displayIndex = 0; displayIndex < desired; displayIndex++) {
         CGVirtualDisplayDescriptor *descriptor = [[NSClassFromString(@"CGVirtualDisplayDescriptor") alloc] init];
         descriptor.name = desired == 1
             ? @"Retina Dummy"
             : [NSString stringWithFormat:@"Retina Dummy %lu", (unsigned long)(displayIndex + 1)];
-        descriptor.maxPixelsWide = p.width;
-        descriptor.maxPixelsHigh = p.height;
+        // Advertise the supported maximum once so later settings can be applied
+        // in-place without changing the virtual display ID.
+        descriptor.maxPixelsWide = MAX(8192,p.width);
+        descriptor.maxPixelsHigh = MAX(8192,p.height);
         descriptor.sizeInMillimeters = CGSizeMake(600, 600.0 * p.height / p.width);
         descriptor.redPrimary = CGPointMake(0.680, 0.320);
         descriptor.greenPrimary = CGPointMake(0.265, 0.690);
@@ -849,14 +1907,8 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
             return nil;
         }
 
-        NSMutableArray *modes = [NSMutableArray array];
-        [modes addObject:[[modeClass alloc] initWithWidth:p.width height:p.height refreshRate:self.selectedRefreshRate]];
-        const double scales[] = {0.90, 0.80, 0.75, 2.0 / 3.0};
-        for (NSUInteger i = 0; i < sizeof(scales) / sizeof(scales[0]); i++) {
-            unsigned int width = ((unsigned int)(p.width * scales[i]) / 2) * 2;
-            unsigned int height = ((unsigned int)(p.height * scales[i]) / 2) * 2;
-            [modes addObject:[[modeClass alloc] initWithWidth:width height:height refreshRate:self.selectedRefreshRate]];
-        }
+        NSArray *modes=[self virtualModesForProfile:p rate:self.selectedRefreshRate];
+        if (!modes.count) { [created removeAllObjects]; return nil; }
 
         CGVirtualDisplaySettings *settings = [[NSClassFromString(@"CGVirtualDisplaySettings") alloc] init];
         settings.modes = modes;
@@ -885,6 +1937,7 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
 
 - (void)restorePhysicalDisplay:(id)sender {
     (void)sender;
+    if (self.mirrorOriginals.count && ![self restoreVirtualMirrorTargets]) { self.displaySettingsIssue=@"恢复实体屏未完成，保留虚拟画面；请勿退出软件。"; [self rebuildMenu]; return; }
     if (!self.mirroredPhysicalDisplay) return;
     if (!CGDisplayIsOnline(self.mirroredPhysicalDisplay) ||
         [self configurePhysicalDisplay:self.mirroredPhysicalDisplay mirror:
@@ -894,35 +1947,10 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
     [self rebuildMenu];
 }
 
-- (void)enablePhysicalHiDPI:(NSMenuItem *)sender {
-    if (self.preferPhysicalDisplays) {
-        [self showError:@"实体屏优先模式不会为高清缩放额外创建屏幕。请先关闭“实体屏优先，按总屏幕数补足”再使用镜像缩放。"];
-        return;
-    }
-    CGDirectDisplayID target = [sender.representedObject unsignedIntValue];
-    if (!CGDisplayIsOnline(target)) { [self showError:@"显示器已断开，请重新打开菜单。"]; return; }
-    NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = @"开启真实显示器高清缩放？";
-    alert.informativeText = @"将真实显示器镜像到 Retina Dummy，使用当前 HiDPI 分辨率。屏幕可能短暂闪烁；可从菜单恢复镜像设置。";
-    [alert addButtonWithTitle:@"开启"]; [alert addButtonWithTitle:@"取消"];
-    if ([alert runModal] != NSAlertFirstButtonReturn) return;
-    if (self.mirroredPhysicalDisplay && self.mirroredPhysicalDisplay != target) {
-        [self restorePhysicalDisplay:nil]; if (self.mirroredPhysicalDisplay) return;
-    }
-    [self startDisplay:nil];
-    if (!self.displays.count) return;
-    CGDirectDisplayID source = self.displays.firstObject.displayID;
-    CGDirectDisplayID previous = CGDisplayMirrorsDisplay(target);
-    if ([self configurePhysicalDisplay:target mirror:source]) {
-        if (self.mirroredPhysicalDisplay != target) self.previousMirror = previous;
-        self.mirroredPhysicalDisplay = target; [self rebuildMenu];
-    }
-}
-
 - (void)stopDisplay:(id)sender {
     if (sender) self.displayManagementEnabled = NO;
     [self restorePhysicalDisplay:nil];
-    if (self.mirroredPhysicalDisplay) return;
+    if (self.mirroredPhysicalDisplay || self.mirrorOriginals.count) return;
     self.displays = nil;
     self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"display" accessibilityDescription:@"Retina Dummy"];
     [self rebuildMenu];
@@ -930,8 +1958,12 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     (void)sender;
+    if (self.applyingDisplaySettings) {
+        [NSApp abortModal]; // Return through the same rollback path before allowing exit.
+        return NSTerminateCancel;
+    }
     [self restorePhysicalDisplay:nil];
-    if (self.mirroredPhysicalDisplay) return NSTerminateCancel;
+    if (self.mirroredPhysicalDisplay || self.mirrorOriginals.count) return NSTerminateCancel;
     self.displayManagementEnabled = NO;
     ++self.displayChangeGeneration;
     CGDisplayRemoveReconfigurationCallback(RetinaDisplayChanged, (__bridge void *)self);
