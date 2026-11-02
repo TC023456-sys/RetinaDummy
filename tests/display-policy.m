@@ -5,6 +5,8 @@
 @property NSUInteger physical;
 @property NSUInteger creations;
 @property NSUInteger reconciliations;
+@property BOOL failCreation;
+@property BOOL reenterDuringCreation;
 @end
 @implementation PolicyProbe
 - (NSUInteger)physicalDisplayCount { return self.physical; }
@@ -12,6 +14,8 @@
 - (void)restorePhysicalDisplay:(id)sender { (void)sender; }
 - (NSMutableArray *)createVirtualDisplays:(NSUInteger)desired {
     self.creations++;
+    if (self.reenterDuringCreation) [self startDisplay:nil];
+    if (self.failCreation) return nil;
     NSMutableArray *a = [NSMutableArray array];
     for (NSUInteger i=0; i<desired; i++) [a addObject:[NSObject new]];
     return a;
@@ -40,5 +44,9 @@ int main(void) { @autoreleasepool {
     d.physical=2; [d startDisplay:nil]; assert(d.displays.count==0);
     d.physical=0; [d startDisplay:nil]; assert(d.displays.count==2);
     d.preferPhysicalDisplays=NO; d.physical=1; [d startDisplay:nil]; assert(d.displays.count==2);
+    d.displays=nil; d.physical=0; d.failCreation=YES; d.reenterDuringCreation=YES; d.failedVirtualCreationSignature=nil;
+    [d startDisplay:nil]; created=d.creations;
+    [d scheduleDisplayReconciliation]; drain(); assert(d.creations==created);
+    [d startDisplay:[NSObject new]]; assert(d.creations==created+1); // Explicit retry only.
     puts("PASS: physical priority, disconnect fallback, reconnect removal, idempotence, pause race, resume, enumeration failure, counts 1/2, legacy mode");
 }}
