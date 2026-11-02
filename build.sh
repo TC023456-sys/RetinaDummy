@@ -6,15 +6,19 @@ STAGE="$(mktemp -d)/Retina Dummy.app"
 trap 'rm -rf "${STAGE:h}"' EXIT
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
 
-VERSION="${VERSION:-0.8.7}"
-BUILD_NUMBER="${BUILD_NUMBER:-18}"
+VERSION="${VERSION:-0.8.23}"
+BUILD_NUMBER="${BUILD_NUMBER:-34}"
 SIGNING_IDENTITY="${SIGNING_IDENTITY:--}"
 
 mkdir -p "${OUT:h}"
 
 clang -arch arm64 -arch x86_64 -Wall -Wextra -fobjc-arc -fmodules -mmacosx-version-min=13.0 \
-  -framework Cocoa -framework CoreGraphics -framework ServiceManagement \
+  -framework Cocoa -framework CoreGraphics -framework ColorSync -framework ServiceManagement \
   "$ROOT/main.m" "$ROOT/BrightnessController.m" -o "$STAGE/Contents/MacOS/RetinaDummy"
+clang -arch arm64 -arch x86_64 -Wall -Wextra -Werror -fobjc-arc -mmacosx-version-min=13.0 \
+  -framework Cocoa -framework CoreGraphics -framework ColorSync -framework CoreVideo \
+  "$ROOT/DisplayStateHelper.m" -o "$STAGE/Contents/Resources/RetinaDisplayState"
+codesign --force --sign "$SIGNING_IDENTITY" "$STAGE/Contents/Resources/RetinaDisplayState"
 clang -arch arm64 -Wall -Wextra -fmodules -mmacosx-version-min=13.0 -DMAX_DISPLAYS=64 \
   -I "$ROOT/ThirdParty/m1ddc/headers" -framework CoreDisplay \
   "$ROOT/BrightnessHelper.m" "$ROOT/ThirdParty/m1ddc/sources/ioregistry.m" "$ROOT/ThirdParty/m1ddc/sources/i2c.m" \
