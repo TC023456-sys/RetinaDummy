@@ -131,6 +131,10 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 @property(nonatomic) NSUInteger selectedProfile;
 @property(nonatomic) NSUInteger selectedDisplayCount;
 @property(nonatomic) BOOL preferPhysicalDisplays;
+@property(nonatomic) BOOL separateDisplaySettings;
+@property(nonatomic) BOOL keepIndependentVirtual;
+@property(nonatomic) NSUInteger independentVirtualProfile;
+@property(nonatomic) double independentVirtualRate;
 @property(nonatomic) BOOL displayManagementEnabled;
 @property(nonatomic) NSUInteger displayChangeGeneration;
 @property(nonatomic) unsigned int customLogicalWidth;
@@ -148,6 +152,10 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 @property(nonatomic, copy) NSString *displaySettingsIssue;
 @property(nonatomic, copy) NSString *failedSettingsSignature;
 @property(nonatomic, copy) NSString *failedVirtualCreationSignature;
+@property(nonatomic, copy) NSString *lastAutomaticPhysicalTopology;
+@property(nonatomic, copy) NSString *pendingPhysicalTopology;
+@property(nonatomic) NSTimeInterval handoffRecoveryUntil;
+@property(nonatomic) BOOL handoffFallbackAttempted;
 @property(nonatomic) BOOL suspendSavedSettings;
 @property(nonatomic) BOOL reconcilingDisplays;
 @property(nonatomic) BOOL displayReconciliationPending;
@@ -171,6 +179,9 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 - (void)checkAutomatically:(id)sender;
 - (void)beginUpdateCheckManual:(BOOL)manual;
 - (DisplayProfile)currentProfile;
+- (DisplayProfile)independentVirtualFormat;
+- (BOOL)applyIndependentVirtualProfile:(NSUInteger)profile rate:(double)rate error:(NSString **)error;
+- (void)showIndependentVirtualSettings:(id)sender;
 - (void)restartDisplaysIfActive;
 - (void)showResolutionPicker:(id)sender;
 - (void)showCustomResolutionAtRate:(double)rate;
@@ -178,10 +189,13 @@ static NSTextField *MakeLabel(NSString *text, CGFloat size, NSFontWeight weight,
 - (NSUInteger)physicalDisplayCount;
 - (NSMutableArray<CGVirtualDisplay *> *)createVirtualDisplays:(NSUInteger)desired;
 - (void)scheduleDisplayReconciliation;
+- (void)displayConfigurationChanged:(CGDisplayChangeSummaryFlags)flags;
+- (BOOL)physicalDisplaysAreLowResolutionFallback:(NSArray<NSNumber *> *)ids;
 - (void)flushPendingDisplayReconciliation;
 - (void)enqueueDisplayReconciliationAfter:(NSTimeInterval)delay generation:(NSUInteger)generation;
 - (void)performDisplayReconciliationForGeneration:(NSUInteger)generation;
 - (NSArray<NSNumber *> *)physicalDisplayIDs;
+- (NSString *)automaticPhysicalTopologyForDisplays:(NSArray<NSNumber *> *)ids;
 - (void)applyUnifiedSettingsProfile:(NSUInteger)profile width:(unsigned int)width height:(unsigned int)height rate:(double)rate;
 - (void)applySavedSettingsToActiveDisplays;
 - (NSArray<NSDictionary *> *)publicNativeFormatsForDisplay:(CGDirectDisplayID)display;
@@ -205,7 +219,7 @@ static void RetinaDisplayChanged(CGDirectDisplayID display, CGDisplayChangeSumma
     (void)display;
     if (flags & kCGDisplayBeginConfigurationFlag) return;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [(__bridge AppDelegate *)context scheduleDisplayReconciliation];
+        [(__bridge AppDelegate *)context displayConfigurationChanged:flags];
     });
 }
 
@@ -274,6 +288,13 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
     double savedRefreshRate = [[NSUserDefaults standardUserDefaults] doubleForKey:@"refreshRate"];
     self.selectedRefreshRate = isfinite(savedRefreshRate) && savedRefreshRate >= 1 && savedRefreshRate <= 1000 ? savedRefreshRate : 60;
 
+    self.separateDisplaySettings=!self.virtualMirrorEnabled;
+    self.keepIndependentVirtual=[settings boolForKey:@"keepIndependentVirtual"];
+    NSInteger virtualProfile=[settings objectForKey:@"independentVirtualProfile"] ? [settings integerForKey:@"independentVirtualProfile"] : 3;
+    self.independentVirtualProfile=(NSUInteger)MAX(0,MIN((NSInteger)kProfileCount-1,virtualProfile));
+    double virtualRate=[settings doubleForKey:@"independentVirtualRate"];
+    self.independentVirtualRate=isfinite(virtualRate)&&virtualRate>=1&&virtualRate<=240 ? virtualRate : 60;
+
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
     self.statusItem.button.image = [NSImage imageWithSystemSymbolName:@"display" accessibilityDescription:@"Retina Dummy"];
     self.statusItem.button.toolTip = @"Retina Dummy 虚拟显示器";
@@ -298,7 +319,15 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
 - (BOOL)applicationShouldHandleReopen:(NSApplication *)sender hasVisibleWindows:(BOOL)visible {
     (void)sender; (void)visible;
     if (NSApp.modalWindow) [NSApp.modalWindow makeKeyAndOrderFront:nil];
-    else dispatch_async(dispatch_get_main_queue(), ^{ [self showResolutionPicker:nil]; });
+    else dispatch_async(dispatch_get_main_queue(), ^{
+        if(!self.separateDisplaySettings) { [self showResolutionPicker:nil]; return; }
+        NSAlert *choice=[NSAlert new]; choice.messageText=@"选择要设置的屏幕";
+        choice.informativeText=@"实体屏和远程虚拟屏分别保存尺寸。UU 显示哪块屏，由 UU 的屏幕选择决定。";
+        [choice addButtonWithTitle:@"实体屏设置"]; [choice addButtonWithTitle:@"远程虚拟屏设置"]; [choice addButtonWithTitle:@"关闭"];
+        NSModalResponse result=[choice runModal];
+        if(result==NSAlertFirstButtonReturn) [self showResolutionPicker:nil];
+        else if(result==NSAlertSecondButtonReturn) [self showIndependentVirtualSettings:nil];
+    });
     return NO;
 }
 
@@ -356,11 +385,15 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
     }
     DisplayProfile currentProfile = [self currentProfile];
     NSMenuItem *resolutionItem = [[NSMenuItem alloc]
-        initWithTitle:[NSString stringWithFormat:@"统一显示设置…   %u × %u @ %.0fHz%@", currentProfile.logicalWidth, currentProfile.logicalHeight, self.selectedRefreshRate, self.unifiedSettingsEnabled ? @"" : @"（待应用）"]
+        initWithTitle:[NSString stringWithFormat:(self.separateDisplaySettings ? @"实体屏设置…   %u × %u @ %.0fHz%@" : @"统一显示设置…   %u × %u @ %.0fHz%@"), currentProfile.logicalWidth, currentProfile.logicalHeight, self.selectedRefreshRate, self.unifiedSettingsEnabled ? @"" : @"（待应用）"]
                action:@selector(showResolutionPicker:)
         keyEquivalent:@""];
     resolutionItem.target = self;
     [menu addItem:resolutionItem];
+    if (self.separateDisplaySettings) {
+        NSMenuItem *virtualItem=[[NSMenuItem alloc] initWithTitle:@"远程虚拟屏设置…（独立扩展屏）" action:@selector(showIndependentVirtualSettings:) keyEquivalent:@""];
+        virtualItem.target=self; [menu addItem:virtualItem];
+    }
     if (self.displaySettingsIssue.length) {
         NSMenuItem *issue = [[NSMenuItem alloc] initWithTitle:@"查看显示状态…" action:@selector(showDisplaySettingsIssue:) keyEquivalent:@""];
         issue.target = self; [menu addItem:issue];
@@ -668,11 +701,68 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
     [self applyUnifiedSettingsProfile:(NSUInteger)sender.tag width:self.customLogicalWidth height:self.customLogicalHeight rate:self.selectedRefreshRate];
 }
 
+- (DisplayProfile)independentVirtualFormat { return kProfiles[MIN(self.independentVirtualProfile,kProfileCount-1)]; }
+
+- (BOOL)applyIndependentVirtualProfile:(NSUInteger)profile rate:(double)rate error:(NSString **)error {
+    if(profile>=kProfileCount || !isfinite(rate) || rate<1 || rate>240 || self.applyingDisplaySettings) return NO;
+    NSArray *ids=[self IDsForVirtualDisplays:self.displays];
+    DisplayProfile old=[self independentVirtualFormat], requested=kProfiles[profile];
+    double oldRate=self.independentVirtualRate;
+    NSDictionary *before=ids.count ? [self currentModesForDisplays:ids] : @{};
+    if(!before) { if(error)*error=@"无法保存虚拟屏当前模式，未更改。"; return NO; }
+    BOOL ok=YES; self.applyingDisplaySettings=YES;
+    @try {
+        if(ids.count) {
+            ok=[self advertiseVirtualDisplays:self.displays profile:requested rate:rate];
+            NSDictionary *plan=nil;
+            for(NSUInteger attempt=0;ok && !plan && attempt<10;attempt++) {
+                plan=[self virtualModePlan:ids profile:requested rate:rate];
+                if(!plan) [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+            }
+            ok=ok && plan && [self configureModes:plan] && [self modesAreCurrent:plan];
+            if(!ok) { [self advertiseVirtualDisplays:self.displays profile:old rate:oldRate]; [self restoreModes:before]; }
+        }
+        if(ok) {
+            self.independentVirtualProfile=profile; self.independentVirtualRate=rate;
+            [NSUserDefaults.standardUserDefaults setInteger:profile forKey:@"independentVirtualProfile"];
+            [NSUserDefaults.standardUserDefaults setDouble:rate forKey:@"independentVirtualRate"];
+        } else if(error) *error=@"虚拟屏未接受所选模式，已尝试恢复。实体屏设置未更改。";
+    } @finally { self.applyingDisplaySettings=NO; }
+    return ok;
+}
+
+- (void)showIndependentVirtualSettings:(id)sender {
+    (void)sender;
+    NSAlert *alert=[NSAlert new]; alert.messageText=@"远程虚拟屏设置";
+    alert.informativeText=@"只设置本软件创建的 Retina Dummy 虚拟屏，不修改实体屏。\nUU 需要手动选择该虚拟屏；这里不会替 UU 切屏。";
+    [alert addButtonWithTitle:@"保存并应用"]; [alert addButtonWithTitle:@"取消"];
+    NSView *view=[[NSView alloc] initWithFrame:NSMakeRect(0,0,420,120)];
+    NSPopUpButton *sizes=[[NSPopUpButton alloc] initWithFrame:NSMakeRect(0,80,420,28) pullsDown:NO];
+    for(NSUInteger i=0;i<kProfileCount;i++) [sizes addItemWithTitle:@(kProfiles[i].title)];
+    [sizes selectItemAtIndex:self.independentVirtualProfile];
+    NSPopUpButton *rates=[[NSPopUpButton alloc] initWithFrame:NSMakeRect(0,40,160,28) pullsDown:NO];
+    for(NSNumber *rate in @[@30,@60,@90,@120,@144,@165,@240]) {
+        [rates addItemWithTitle:[NSString stringWithFormat:@"%@ Hz",rate]]; rates.lastItem.representedObject=rate;
+        if(fabs(rate.doubleValue-self.independentVirtualRate)<0.1) [rates selectItem:rates.lastItem];
+    }
+    NSButton *keep=[NSButton checkboxWithTitle:@"实体屏连接时也保留虚拟扩展屏" target:nil action:nil];
+    keep.frame=NSMakeRect(0,0,420,28); keep.state=self.keepIndependentVirtual ? NSControlStateValueOn : NSControlStateValueOff;
+    [view addSubview:sizes]; [view addSubview:rates]; [view addSubview:keep]; alert.accessoryView=view;
+    if([alert runModal]!=NSAlertFirstButtonReturn) return;
+    NSString *error=nil;
+    if(![self applyIndependentVirtualProfile:(NSUInteger)sizes.indexOfSelectedItem rate:[rates.selectedItem.representedObject doubleValue] error:&error]) { [self showError:error]; return; }
+    self.keepIndependentVirtual=keep.state==NSControlStateValueOn;
+    [NSUserDefaults.standardUserDefaults setBool:self.keepIndependentVirtual forKey:@"keepIndependentVirtual"];
+    self.failedVirtualCreationSignature=nil;
+    [self startDisplay:nil]; [self rebuildMenu];
+}
+
 - (void)showResolutionPicker:(id)sender {
     (void)sender;
     NSArray *physical = [self physicalDisplayIDs];
     if (!physical) { [self showError:@"无法读取当前显示器，未更改设置。"]; return; }
     if (physical.count && !self.virtualMirrorEnabled) { [self showPhysicalResolutionPicker:physical]; return; }
+    if(self.separateDisplaySettings) { [self showError:@"当前没有实体屏。请使用远程虚拟屏设置。" ]; return; }
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"统一显示设置";
     CGDirectDisplayID mainDisplay = CGMainDisplayID();
@@ -866,7 +956,7 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
 - (void)showPhysicalResolutionPicker:(NSArray<NSNumber *> *)physical {
     NSArray *formats = [self nativeFormatsForDisplays:physical];
     NSAlert *alert = [NSAlert new];
-    alert.messageText = @"统一显示设置";
+    alert.messageText = self.separateDisplaySettings ? @"实体屏设置" : @"统一显示设置";
     NSMutableArray *names = [NSMutableArray array];
     for (NSNumber *display in physical) [names addObject:PhysicalDisplayName(display.unsignedIntValue)];
     BOOL mainPhysical = [physical containsObject:@(CGMainDisplayID())];
@@ -1690,13 +1780,32 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
     if (!self.unifiedSettingsEnabled || self.applyingDisplaySettings || self.suspendSavedSettings) return;
     NSArray *physical = [self physicalDisplayIDs];
     if (!physical) return;
-    NSArray *ids = [physical arrayByAddingObjectsFromArray:[self IDsForVirtualDisplays:self.displays]];
+    NSString *topology = [self automaticPhysicalTopologyForDisplays:physical];
+    if (!topology) return; // Unknown identity is not permission to reconfigure hardware.
+    BOOL topologyChanged = ![topology isEqualToString:self.lastAutomaticPhysicalTopology];
+    // Record the attempt before any transaction can emit more callbacks. Mode
+    // changes are not hotplug events: never repeatedly bridge native HiDPI on
+    // an unchanged physical topology, including a wake with the same screens.
+    self.lastAutomaticPhysicalTopology = topology;
+    if(self.separateDisplaySettings && !physical.count) return;
+    NSArray *ids = self.separateDisplaySettings ? physical : [physical arrayByAddingObjectsFromArray:[self IDsForVirtualDisplays:self.displays]];
+    BOOL pureNative = physical.count && (self.separateDisplaySettings || !self.displays.count) && ids.count == physical.count;
+    BOOL lateFallback = pureNative && !topologyChanged && !self.handoffFallbackAttempted &&
+        self.handoffRecoveryUntil > NSProcessInfo.processInfo.systemUptime &&
+        [self physicalDisplaysAreLowResolutionFallback:physical];
+    if (pureNative && !topologyChanged && !lateFallback) return;
+    if (lateFallback) {
+        // Consume before restoring: callbacks from our own transaction cannot
+        // initiate a second recovery, even if the external low mode persists.
+        self.handoffFallbackAttempted=YES;
+        self.failedSettingsSignature=nil;
+        NSLog(@"Remote display handoff: recovering delayed low-resolution fallback once");
+    }
     DisplayProfile p = [self currentProfile];
     NSString *signature = [self settingsSignatureForDisplays:ids profile:p];
     if ([signature isEqualToString:self.failedSettingsSignature]) return;
     NSString *error = nil;
     NSDictionary *plan = [self modePlanForDisplays:ids width:p.logicalWidth height:p.logicalHeight rate:self.selectedRefreshRate error:&error];
-    BOOL pureNative = physical.count && !self.displays.count && ids.count == physical.count;
     if (!pureNative && plan && [self modesAreCurrent:plan]) { self.displaySettingsIssue = nil; return; }
     NSDictionary *previous = !pureNative && plan ? [self currentModesForDisplays:ids] : nil;
     BOOL ok = NO;
@@ -1735,6 +1844,20 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
     return physical;
 }
 
+- (NSString *)automaticPhysicalTopologyForDisplays:(NSArray<NSNumber *> *)ids {
+    NSMutableArray<NSString *> *identities = [NSMutableArray array];
+    for (NSNumber *number in [ids sortedArrayUsingSelector:@selector(compare:)]) {
+        CGDirectDisplayID display = number.unsignedIntValue;
+        CFUUIDRef uuid = CGDisplayCreateUUIDFromDisplayID(display);
+        if (!uuid) return nil;
+        NSString *identity = CFBridgingRelease(CFUUIDCreateString(NULL, uuid));
+        CFRelease(uuid);
+        if (!identity.length) return nil;
+        [identities addObject:[NSString stringWithFormat:@"%u:%@", display, identity]];
+    }
+    return [identities componentsJoinedByString:@"/"];
+}
+
 - (NSUInteger)physicalDisplayCount {
     NSArray *physical = [self physicalDisplayIDs];
     return physical ? physical.count : NSNotFound;
@@ -1744,6 +1867,40 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
     (void)notification;
     self.failedSettingsSignature = nil;
     self.failedVirtualCreationSignature = nil;
+    [self scheduleDisplayReconciliation];
+}
+
+- (BOOL)physicalDisplaysAreLowResolutionFallback:(NSArray<NSNumber *> *)ids {
+    if (ids.count!=1) return NO;
+    DisplayProfile saved=[self currentProfile];
+    if (saved.logicalWidth<=1024 || saved.logicalHeight<=768) return NO;
+    CGDirectDisplayID display=ids.firstObject.unsignedIntValue;
+    if (!CGDisplayIsOnline(display) || CGDisplayIsInMirrorSet(display)) return NO;
+    CGRect bounds=CGDisplayBounds(display);
+    CGDisplayModeRef mode=CGDisplayCopyDisplayMode(display);
+    if (!mode) return NO;
+    size_t width=CGDisplayModeGetWidth(mode),height=CGDisplayModeGetHeight(mode);
+    CFRelease(mode);
+    // Require matching mode and desktop geometry; never repair a stale mode
+    // record or override ordinary user-selected high-resolution modes.
+    double scaleX=width/bounds.size.width, scaleY=height/bounds.size.height;
+    return bounds.size.width>=640 && bounds.size.width<=1024 &&
+        bounds.size.height>=480 && bounds.size.height<=768 &&
+        (fabs(scaleX-1)<0.01 || fabs(scaleX-2)<0.01) && fabs(scaleX-scaleY)<0.01;
+}
+
+- (void)displayConfigurationChanged:(CGDisplayChangeSummaryFlags)flags {
+    BOOL fallbackModeChange=(flags & kCGDisplaySetModeFlag) &&
+        [self physicalDisplaysAreLowResolutionFallback:[self physicalDisplayIDs]];
+    if (((flags & (kCGDisplayAddFlag|kCGDisplayRemoveFlag)) || fallbackModeChange) &&
+        self.displayManagementEnabled && !self.applyingDisplaySettings && !self.reconcilingDisplays) {
+        NSTimeInterval now=NSProcessInfo.processInfo.systemUptime;
+        // One bounded recovery budget per handoff burst, not one per callback.
+        if (now>=self.handoffRecoveryUntil) {
+            self.handoffRecoveryUntil=now+15.0;
+            self.handoffFallbackAttempted=NO;
+        }
+    }
     [self scheduleDisplayReconciliation];
 }
 
@@ -1757,7 +1914,13 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
     }
     self.displayReconciliationPending = NO;
     NSUInteger generation = ++self.displayChangeGeneration;
-    [self enqueueDisplayReconciliationAfter:0.6 generation:generation];
+    NSArray *physical = [self physicalDisplayIDs];
+    self.pendingPhysicalTopology = physical ? [self automaticPhysicalTopologyForDisplays:physical] : nil;
+    // Remote disconnect/wake can briefly withdraw a physical screen. Wait for
+    // the handoff to settle before destroying its virtual source or creating
+    // a replacement; mode-only callbacks keep the short debounce.
+    BOOL handoff = ![self.pendingPhysicalTopology isEqualToString:self.lastAutomaticPhysicalTopology];
+    [self enqueueDisplayReconciliationAfter:(handoff ? 2.0 : 0.6) generation:generation];
 }
 
 - (void)enqueueDisplayReconciliationAfter:(NSTimeInterval)delay generation:(NSUInteger)generation {
@@ -1770,6 +1933,21 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
     if (generation != self.displayChangeGeneration) return;
     if (!self.displayManagementEnabled) { self.displayReconciliationPending = NO; return; }
     if (self.applyingDisplaySettings || self.reconcilingDisplays) { self.displayReconciliationPending = YES; return; }
+    NSArray *physical = [self physicalDisplayIDs];
+    NSString *topology = physical ? [self automaticPhysicalTopologyForDisplays:physical] : nil;
+    if (!topology) return; // An unreadable screen list must never tear down the active desktop.
+    if (![topology isEqualToString:self.pendingPhysicalTopology]) {
+        [self scheduleDisplayReconciliation];
+        return;
+    }
+    // Reconfiguration callbacks can precede the final mode/desktop geometry.
+    // Inspect the settled state instead of relying on callback-time flags.
+    if (!self.virtualMirrorEnabled && self.unifiedSettingsEnabled && !self.suspendSavedSettings &&
+        !self.displays.count && [self physicalDisplaysAreLowResolutionFallback:physical] &&
+        NSProcessInfo.processInfo.systemUptime >= self.handoffRecoveryUntil) {
+        self.handoffRecoveryUntil=NSProcessInfo.processInfo.systemUptime+15.0;
+        self.handoffFallbackAttempted=NO;
+    }
     [self startDisplay:nil]; // Existing suspend, mirror, and saved-mode guards still apply.
 }
 
@@ -1788,6 +1966,7 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
 }
 
 - (void)restartDisplaysIfActive {
+    self.lastAutomaticPhysicalTopology = nil; // Explicit user setting change permits one attempt.
     self.failedVirtualCreationSignature = nil;
     self.failedSettingsSignature = nil;
     [self restorePhysicalDisplay:nil];
@@ -1822,7 +2001,7 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
 
 - (void)startDisplay:(id)sender {
     if (self.applyingDisplaySettings || self.reconcilingDisplays) return;
-    if (sender) { self.displayManagementEnabled = YES; self.failedVirtualCreationSignature = nil; self.failedSettingsSignature = nil; }
+    if (sender) { self.displayManagementEnabled = YES; self.failedVirtualCreationSignature = nil; self.failedSettingsSignature = nil; self.lastAutomaticPhysicalTopology = nil; }
     if (!self.displayManagementEnabled) return;
     if (self.virtualMirrorEnabled) {
         if (sender) self.suspendSavedSettings=NO;
@@ -1848,7 +2027,8 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
     NSUInteger desired = self.preferPhysicalDisplays
         ? (physical >= self.selectedDisplayCount ? 0 : self.selectedDisplayCount - physical)
         : self.selectedDisplayCount;
-    DisplayProfile p = [self currentProfile];
+    DisplayProfile p = self.separateDisplaySettings ? [self independentVirtualFormat] : [self currentProfile];
+    if(self.separateDisplaySettings && self.keepIndependentVirtual) desired=self.selectedDisplayCount;
     NSString *creationSignature = [NSString stringWithFormat:@"%lu/%lu/%u/%u/%.2f", (unsigned long)physical, (unsigned long)desired, p.width, p.height, self.selectedRefreshRate];
     if ([creationSignature isEqualToString:self.failedVirtualCreationSignature]) { [self rebuildMenu]; return; }
     if (self.displays.count == desired) { [self applySavedSettingsToActiveDisplays]; [self rebuildMenu]; return; }
@@ -1866,6 +2046,10 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
         self.failedVirtualCreationSignature = self.displays ? nil : creationSignature;
     } @finally { self.reconcilingDisplays = NO; }
     self.statusItem.button.image = [NSImage imageWithSystemSymbolName:(self.displays.count ? @"display.2" : @"display") accessibilityDescription:@"Retina Dummy"];
+    if(self.separateDisplaySettings && self.displays.count) {
+        NSString *virtualError=nil;
+        if(![self applyIndependentVirtualProfile:self.independentVirtualProfile rate:self.independentVirtualRate error:&virtualError]) self.displaySettingsIssue=virtualError;
+    }
     [self applySavedSettingsToActiveDisplays]; [self rebuildMenu];
     [self scheduleDisplayReconciliation];
 }
@@ -1877,7 +2061,8 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
         return nil;
     }
 
-    DisplayProfile p = [self currentProfile];
+    DisplayProfile p = self.separateDisplaySettings ? [self independentVirtualFormat] : [self currentProfile];
+    double creationRate=self.separateDisplaySettings ? self.independentVirtualRate : self.selectedRefreshRate;
     NSMutableArray<CGVirtualDisplay *> *created = [NSMutableArray array];
 
     for (NSUInteger displayIndex = 0; displayIndex < desired; displayIndex++) {
@@ -1907,7 +2092,7 @@ static BOOL RDLogicalSizeMatchesDesktop(NSUInteger width,NSUInteger height,NSSiz
             return nil;
         }
 
-        NSArray *modes=[self virtualModesForProfile:p rate:self.selectedRefreshRate];
+        NSArray *modes=[self virtualModesForProfile:p rate:creationRate];
         if (!modes.count) { [created removeAllObjects]; return nil; }
 
         CGVirtualDisplaySettings *settings = [[NSClassFromString(@"CGVirtualDisplaySettings") alloc] init];

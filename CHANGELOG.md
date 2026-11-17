@@ -1,3 +1,34 @@
+# 0.8.29
+
+- Separate physical and remote virtual display settings, storage and mode transactions.
+- 默认保持实体屏优先与单屏运行，不因远程连接额外创建扩展屏；虚拟屏完整尺寸保留在独立入口。
+- Explicit display selection on reopen. UU still selects its own capture display.
+
+# 0.8.28
+
+- Detect low-resolution fallback after display reconfiguration settles; preserve the bounded recovery budget. Verified 800×600 to 2048×1152 HiDPI at 165 Hz through System Settings.
+
+# 0.8.27
+
+- Recover mode-only low-resolution changes, including 800×600 logical Retina modes, with one bounded restoration per event burst.
+
+# v0.8.26 — 未发布
+
+- 显示器添加/移除交接后提供 15 秒、至多一次的延迟低分辨率恢复预算；同一实体屏连接关系下晚到的 800×600/1024×768 回退不再被一次恢复保护完全忽略。
+- 仅对独立单实体屏、已保存高分辨率、当前模式和实际桌面尺寸一致的低档状态生效；尊重暂停自动设置，不修改普通分辨率变化或虚拟镜像策略。
+- 回归验证同屏晚到回退、过期预算、100 次通知无反复恢复、普通设置和暂停保护。未实测真实远程退出流程。
+
+# v0.8.25 — 未发布
+
+- 远程断开或唤醒期间，实体屏连接关系变化等待 2 秒，并再次核对显示器身份；瞬时消失、返回和过期通知不再直接触发虚拟屏销毁、重建或实体模式恢复。
+- 无法读取显示器列表时保留当前桌面。增加虚拟转实体交接、枚举失败和 100 次连接抖动回归测试。
+
+# v0.8.24 — 未发布
+
+- 实体屏自动恢复按显示器 ID 与 UUID 记录连接关系，同一连接关系最多尝试一次；仅模式变化、系统瞬时读数和同屏唤醒不再触发反复恢复，避免 HiDPI 桥接引发循环切换。
+- 真正断开、重新连接和显式手动重试仍可恢复保存的模式，虚拟屏数量管理及手动应用、确认与回滚路径保留。
+- 模拟连续 100 次外部模式变化、同屏唤醒及断开重连验证，不在测试中切换实际显示器；蓝牙设备触发原因与实机重连效果仍需验证。
+
 # v0.8.23 — 2026-11-02
 
 - 单实体屏的分辨率菜单合并公开格式与系统隐藏的 2× HiDPI 格式，按逻辑尺寸、渲染尺寸和刷新率去重，保留普通模式分组。

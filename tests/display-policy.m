@@ -10,6 +10,15 @@
 @end
 @implementation PolicyProbe
 - (NSUInteger)physicalDisplayCount { return self.physical; }
+- (NSArray *)physicalDisplayIDs {
+    if (self.physical==NSNotFound) return nil;
+    NSMutableArray *ids=[NSMutableArray array];
+    for(NSUInteger i=0;i<self.physical;i++) [ids addObject:@(i+1)];
+    return ids;
+}
+- (NSString *)automaticPhysicalTopologyForDisplays:(NSArray *)ids {
+    return [ids componentsJoinedByString:@"/"];
+}
 - (void)rebuildMenu {}
 - (void)restorePhysicalDisplay:(id)sender { (void)sender; }
 - (NSMutableArray *)createVirtualDisplays:(NSUInteger)desired {
@@ -23,7 +32,7 @@
 - (void)startDisplay:(id)sender { self.reconciliations++; [super startDisplay:sender]; }
 @end
 static void drain(void) {
-    NSDate *end=[NSDate dateWithTimeIntervalSinceNow:0.85];
+    NSDate *end=[NSDate dateWithTimeIntervalSinceNow:2.2];
     while (end.timeIntervalSinceNow>0) [NSRunLoop.currentRunLoop runMode:NSDefaultRunLoopMode beforeDate:end];
 }
 int main(void) { @autoreleasepool {

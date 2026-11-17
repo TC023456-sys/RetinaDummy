@@ -6,6 +6,7 @@
 @property NSArray *physicalIDs;
 @property NSNumber *unsupported;
 @property BOOL failVirtual;
+@property BOOL lowResolutionFallback;
 @property BOOL failCommit;
 @property BOOL failVerification;
 @property BOOL keep;
@@ -37,6 +38,9 @@
     self.displays = [NSMutableArray array];
 } return self; }
 - (NSArray *)physicalDisplayIDs { return self.physicalIDs; }
+- (NSString *)automaticPhysicalTopologyForDisplays:(NSArray *)ids {
+    return [[ids sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@"/"];
+}
 - (NSDictionary *)modePlanForDisplays:(NSArray *)ids width:(unsigned int)width height:(unsigned int)height rate:(double)rate error:(NSString **)error {
     NSMutableDictionary *plan = [NSMutableDictionary dictionary];
     for (NSNumber *key in ids) {
@@ -45,6 +49,10 @@
     }
     return plan;
 }
+- (NSDictionary *)virtualModePlan:(NSArray *)ids profile:(DisplayProfile)p rate:(double)rate {
+    return [self modePlanForDisplays:ids width:p.logicalWidth height:p.logicalHeight rate:rate error:NULL];
+}
+- (BOOL)physicalDisplaysAreLowResolutionFallback:(NSArray *)ids { return ids.count==1 && self.lowResolutionFallback; }
 - (NSDictionary *)currentModesForDisplays:(NSArray *)ids {
     NSMutableDictionary *modes = [NSMutableDictionary dictionary];
     for (NSNumber *key in ids) modes[key] = @"original";
@@ -147,7 +155,24 @@ int main(void) { @autoreleasepool {
     p=[UnifiedProbe new]; [p applyUnifiedSettingsProfile:kProfileCount width:1 height:480 rate:60]; assert(p.commits==0);
     p=[UnifiedProbe new]; [p applySavedSettingsToActiveDisplays]; assert(p.commits==0); // Safe upgrade migration.
     p.unifiedSettingsEnabled=YES; [p applySavedSettingsToActiveDisplays]; assert(p.commits==1 && p.nativeRecoveryAttempts==1);
-    [p applySavedSettingsToActiveDisplays]; assert(p.commits==1 && p.nativeRecoveryAttempts==2); // Fresh verification, no mode-change loop.
+    [p applySavedSettingsToActiveDisplays]; assert(p.commits==1 && p.nativeRecoveryAttempts==1);
+    // A mode-only event (including a Bluetooth-related wake) must not fight
+    // with an external setting or transient mode readback on the same screen.
+    p.activePlan=nil;
+    for (NSUInteger i=0;i<100;i++) { p.activePlan=nil; [p applySavedSettingsToActiveDisplays]; }
+    assert(p.commits==1 && p.nativeRecoveryAttempts==1);
+    [p displayWake:nil];
+    [p performDisplayReconciliationForGeneration:p.queuedReconciliationGeneration];
+    assert(p.commits==1 && p.nativeRecoveryAttempts==1);
+    // A real disconnect/reconnect permits exactly one fresh restore, even if
+    // macOS reuses the previous display ID. Virtual-only settings still work.
+    p.physicalIDs=@[]; [p applySavedSettingsToActiveDisplays];
+    p.physicalIDs=@[@1]; p.activePlan=nil; commits=p.commits;
+    [p applySavedSettingsToActiveDisplays];
+    assert(p.commits==commits+1 && p.nativeRecoveryAttempts==2);
+    commits=p.commits;
+    for (NSUInteger i=0;i<100;i++) { p.activePlan=nil; [p applySavedSettingsToActiveDisplays]; }
+    assert(p.commits==commits && p.nativeRecoveryAttempts==2);
     p=[UnifiedProbe new]; p.unifiedSettingsEnabled=YES; p.unsupported=@1;
     [p applySavedSettingsToActiveDisplays]; assert(p.failedSettingsSignature && p.commits==0 && p.hiddenNativeAttempts==1);
     assert([p.displaySettingsIssue containsString:@"original mode restored"]);
@@ -191,5 +216,64 @@ int main(void) { @autoreleasepool {
     p.applyingDisplaySettings=YES; [p scheduleDisplayReconciliation]; p.applyingDisplaySettings=NO;
     [p performDisplayReconciliationForGeneration:p.queuedReconciliationGeneration];
     assert(p.commits==0 && p.nativeRecoveryAttempts==0 && p.suspendSavedSettings); // Never override user cancellation.
-    puts("PASS: exact HiDPI/rate matching, physical/system-virtual classification, shared physical+virtual plan, 1/2/3-screen policy, unsupported-mode preflight, creation/commit/verification failure, cancel/timeout rollback path, preference atomicity, upgrade migration, reconciliation idempotence");
+    // A remote handoff must not act on a transient physical-screen snapshot.
+    p=[UnifiedProbe new]; p.displays=[@[@100] mutableCopy];
+    p.physicalIDs=@[]; [p scheduleDisplayReconciliation]; queued=p.queuedReconciliationGeneration;
+    p.physicalIDs=@[@1]; [p performDisplayReconciliationForGeneration:queued];
+    assert(p.reconciliationStarts==0 && p.creations==0 && p.displays.count==1);
+    [p performDisplayReconciliationForGeneration:p.queuedReconciliationGeneration];
+    assert(p.reconciliationStarts==1 && p.displays.count==0 && p.creations==0);
+    // An unreadable list preserves the virtual desktop; stale work cannot run.
+    p=[UnifiedProbe new]; p.displays=[@[@100] mutableCopy];
+    [p scheduleDisplayReconciliation]; queued=p.queuedReconciliationGeneration;
+    p.physicalIDs=nil; [p performDisplayReconciliationForGeneration:queued];
+    assert(p.reconciliationStarts==0 && p.displays.count==1);
+    for(NSUInteger i=0;i<100;i++) {
+        p.physicalIDs=(i%2 ? @[@1] : @[]); [p scheduleDisplayReconciliation];
+    }
+    [p performDisplayReconciliationForGeneration:queued];
+    assert(p.reconciliationStarts==0 && p.displays.count==1);
+    // Late fallback after a handoff on the SAME physical topology was ignored.
+    p=[UnifiedProbe new]; p.unifiedSettingsEnabled=YES; p.physicalIDs=@[@1];
+    [p applySavedSettingsToActiveDisplays]; commits=p.nativeRecoveryAttempts;
+    p.lowResolutionFallback=YES; p.activePlan=nil;
+    [p applySavedSettingsToActiveDisplays]; assert(p.nativeRecoveryAttempts==commits);
+    [p displayConfigurationChanged:kCGDisplaySetModeFlag];
+    [p applySavedSettingsToActiveDisplays]; assert(p.nativeRecoveryAttempts==commits+1);
+    for(NSUInteger i=0;i<100;i++) {
+        p.activePlan=nil; [p displayConfigurationChanged:kCGDisplayAddFlag];
+        [p applySavedSettingsToActiveDisplays];
+    }
+    assert(p.nativeRecoveryAttempts==commits+1); // No callback-driven mode fight.
+    p.handoffRecoveryUntil=NSProcessInfo.processInfo.systemUptime-1;
+    p.handoffFallbackAttempted=NO; p.activePlan=nil;
+    [p applySavedSettingsToActiveDisplays]; assert(p.nativeRecoveryAttempts==commits+1);
+    [p displayConfigurationChanged:kCGDisplayRemoveFlag]; p.lowResolutionFallback=NO;
+    [p applySavedSettingsToActiveDisplays]; assert(p.nativeRecoveryAttempts==commits+1);
+    p.lowResolutionFallback=YES; p.suspendSavedSettings=YES;
+    [p applySavedSettingsToActiveDisplays]; assert(p.nativeRecoveryAttempts==commits+1);
+    p=[UnifiedProbe new]; p.unifiedSettingsEnabled=YES;
+    [p applySavedSettingsToActiveDisplays]; commits=p.nativeRecoveryAttempts;
+    [p scheduleDisplayReconciliation]; // Callback sees the old mode.
+    p.lowResolutionFallback=YES; // Final geometry settles afterwards.
+    [p performDisplayReconciliationForGeneration:p.queuedReconciliationGeneration];
+    assert(p.nativeRecoveryAttempts==commits+1);
+    [p scheduleDisplayReconciliation];
+    [p performDisplayReconciliationForGeneration:p.queuedReconciliationGeneration];
+    assert(p.nativeRecoveryAttempts==commits+1);
+    // Separate settings never configure a physical ID during a virtual change.
+    p=[UnifiedProbe new]; p.separateDisplaySettings=YES; p.independentVirtualProfile=3; p.independentVirtualRate=60;
+    p.displays=[@[@100] mutableCopy];
+    NSUInteger physicalProfile=p.selectedProfile; double physicalRate=p.selectedRefreshRate;
+    NSString *virtualError=nil;
+    assert([p applyIndependentVirtualProfile:4 rate:90 error:&virtualError]);
+    assert(p.selectedProfile==physicalProfile && p.selectedRefreshRate==physicalRate);
+    assert(p.committedPlan.count==1 && p.committedPlan[@100] && !p.committedPlan[@1]);
+    p.unifiedSettingsEnabled=YES; p.hiddenNativeSucceeds=YES;
+    [p applySavedSettingsToActiveDisplays];
+    assert(p.committedPlan.count==1 && p.committedPlan[@1] && !p.committedPlan[@100]);
+    p.failCommit=YES;
+    assert(![p applyIndependentVirtualProfile:2 rate:60 error:&virtualError]);
+    assert(p.independentVirtualProfile==4 && p.independentVirtualRate==90 && p.rollbacks==1);
+    puts("PASS: unified display settings, rollback, idempotence and bounded delayed-fallback recovery");
 } }
